@@ -1,0 +1,82 @@
+import modules ;
+import feature : feature ;
+import virtual-target ;
+
+BOOST_ROOT = [ modules.peek : BOOST_ROOT ] ;
+TORRENT_ROOT = [ modules.peek : TORRENT_ROOT ] ;
+SQLITE_PATH = [ modules.peek : SQLITE_PATH ] ;
+
+if $(BOOST_ROOT)
+{
+	use-project /boost : $(BOOST_ROOT) ;
+	alias boost_thread : /boost/thread//boost_thread : : : <include>$(BOOST_ROOT) ;
+}
+else
+{
+	lib boost_thread : : <name>boost_thread <link>shared ;
+}
+
+if $(TORRENT_ROOT)
+{
+	use-project /torrent : $(TORRENT_ROOT) ;
+}
+
+VERSION = 0.0.0 ;
+
+feature use-boost : system source : composite ;
+feature use-torrent : source system : composite ;
+feature use-sqlite : system source : composite ;
+
+lib sqlite : : <name>sqlite3 ;
+lib torrent-rasterbar : : <name>torrent-rasterbar ;
+
+CHACHA20POLY1305_SOURCES =
+	chacha
+	chacha20poly1305
+	poly1305
+	;
+
+REPUTATION_SOURCES =
+	lt_identify
+	reputation_manager
+	sha256
+	;
+
+rule tag ( name : type  ? : property-set )
+{
+	name = [ virtual-target.add-prefix-and-suffix $(name) : $(type) : $(property-set) ] ;
+
+	if $(type) = SHARED_LIB &&
+		( ! ( [ $(property-set).get <target-os> ] in windows cygwin ) )
+	{
+		name = $(name).$(VERSION) ;
+	}
+
+	return $(name) ;
+}
+
+lib torrent-reputation
+	: #sources
+	src/$(REPUTATION_SOURCES).cpp
+	src/chacha20poly1305/$(CHACHA20POLY1305_SOURCES).cpp
+
+	: #requirements
+	<link>shared:<define>TORRENT_REPUTATION_BUILDING_SHARED
+	<library>boost_thread
+	<use-torrent>source:<library>/torrent//torrent
+	<use-torrent>system:<library>torrent-rasterbar
+	<use-sqlite>system:<library>sqlite/<link>shared
+	<use-sqlite>source:<source>$(SQLITE_PATH)/sqlite3.c
+	<include>include
+	<use-sqlite>source:<include>$(SQLITE_PATH)
+	<tag>@tag
+
+	# disable bogus deprecation warnings on msvc8
+	<toolset>msvc:<define>_SCL_SECURE_NO_DEPRECATE
+	<toolset>msvc:<define>_CRT_SECURE_NO_DEPRECATE
+
+	: # default build
+	: # usage requirements
+	<include>./include
+	<link>shared:<define>TORRENT_REPUTATION_LINKING_SHARED
+	;
