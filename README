@@ -1,0 +1,20 @@
+Libtorrent-reputation is a plugin for libtorrent-rasterbar which implements tracking peer reputation across multiple swarms. Reputation can be provided via a common intermediary so that even peers who have never directly connected before can establish standing with each other.
+
+For details on the reputation scheme, see https://github.com/ssiloti/bep-persistent-credit/blob/master/one-hop-rep.rst
+
+libtorrent-reputation requires the following dependencies to build:
+
+libtorrent-rasterbar >= 1.1
+sqlite 3
+boost >= 1.45
+
+Example usage:
+
+using namespace libtorrent;
+
+session ses;
+reputation_handle reputation;
+boost::shared_ptr<lt_identify_plugin> identify_plugin = boost::make_shared<lt_identify_plugin>();
+ses.add_extension(boost::shared_ptr<plugin>(identify_plugin));
+reputation = create_reputation_plugin(*identify_plugin, client_configuration_diractory, user_password);
+ses.add_extension(reputation.reputation_plugin);
