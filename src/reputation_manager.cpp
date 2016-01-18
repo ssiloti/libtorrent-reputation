@@ -4809,8 +4809,8 @@ Ret sync_call_ret(libtorrent::session_handle ses, boost::function<Ret(void)> f)
 double reputation_handle::global_ratio()
 {
 	reputation_manager* repman = static_cast<reputation_manager*>(reputation_plugin.get());
-	libtorrent::session_handle ses = repman->session().native_handle();
-	return sync_call_ret<double>(ses, boost::bind(&reputation_manager::global_ratio, repman));
+	return sync_call_ret<double>(repman->session()
+		, boost::bind(&reputation_manager::global_ratio, repman));
 }
 
 reputation_handle create_reputation_plugin(lt_identify_plugin& identity
