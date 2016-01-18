@@ -4772,7 +4772,6 @@ namespace
 		bt_peer_connection_handle c(pc);
 		return boost::shared_ptr<peer_plugin>(new reputation_peer_plugin(m_repman, c));
 	}
-} // namespace
 
 void torrent_wait(bool& done, boost::mutex& mut, boost::condition_variable& cond)
 {
@@ -4790,7 +4789,7 @@ void fun_ret(R& ret, bool& done, boost::condition_variable& e, boost::mutex& m, 
 }
 
 template <typename Ret>
-Ret sync_call_ret(libtorrent::session_handle ses, boost::function<Ret(void)> f)
+Ret sync_call_ret(session_handle ses, boost::function<Ret(void)> f)
 {
 	bool done = false;
 	boost::mutex mut;
@@ -4805,6 +4804,8 @@ Ret sync_call_ret(libtorrent::session_handle ses, boost::function<Ret(void)> f)
 	torrent_wait(done, mut, cond);
 	return r;
 }
+
+} // namespace
 
 double reputation_handle::global_ratio()
 {
