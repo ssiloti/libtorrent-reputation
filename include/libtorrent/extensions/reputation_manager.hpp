@@ -52,6 +52,8 @@ namespace libtorrent
 	struct plugin;
 	struct lt_identify_plugin;
 
+	// create_reputation_plugin will throw this if the supplied password
+	// is not the one which was used to encrypt the secret key in the reputation database
 	struct TORRENT_REPUTATION_EXPORT bad_reputation_password : std::exception
 	{
 		virtual char const* what() const throw() { return "invalid reputation password"; }
@@ -65,9 +67,21 @@ namespace libtorrent
 
 		// get the client's global ratio
 		double global_ratio();
+		// pass this to session::add_extension() to register the plugin
 		boost::shared_ptr<plugin> reputation_plugin;
 	};
 
+	// create a reputation plugin instance
+	// parameters:
+	// identity - The instance of the identity plugin to use.
+	//            This must be passed to session::add_extension() to register it with the session
+	//            It is not necessary to populate the plugin's key, it will be loaded from the reputation
+	//            database or generated if no database is found.
+	// storage_path - Path to a directory to store the reputation database in.
+	// sk_password - A password to use to encrypt/decrypt the secret key stored in the reputaion database
+	//               Can be empty in which case anyone with the database file can extract the secret key
+	// The reputation_plugin in the returned handler may be empty if there was a fatal error while
+	// constructing the plugin
 	TORRENT_REPUTATION_EXPORT reputation_handle create_reputation_plugin(lt_identify_plugin& identity
 		, std::string const& storage_path
 		, std::string const& sk_password);

@@ -1,4 +1,4 @@
-Libtorrent-reputation is a plugin for libtorrent-rasterbar which implements tracking peer reputation across multiple swarms. Reputation can be provided via a common intermediary so that even peers who have never directly connected before can establish standing with each other.
+Libtorrent-reputation is a plugin for libtorrent-rasterbar which implements tracking a peer's upload/download volume across multiple swarms. Reputation can be provided via a common intermediary so that even peers who have never directly connected before can establish standing with each other.
 
 For details on the reputation scheme, see https://github.com/ssiloti/bep-persistent-credit/blob/master/one-hop-rep.rst
 
@@ -6,7 +6,7 @@ libtorrent-reputation requires the following dependencies to build:
 
 libtorrent-rasterbar >= 1.1
 sqlite 3
-boost >= 1.45
+boost >= 1.47
 
 Example usage:
 

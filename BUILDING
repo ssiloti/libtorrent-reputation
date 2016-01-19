@@ -1,0 +1,31 @@
+Building libtorrent-reputation with Boost Build v2
+
+Invoke the bjam command from the root of the source tree to build with BBv2.
+For more information about Boost Build see http://www.boost.org/build/
+
+The following options are provided:
+
+use-boost - system (default) - Use the boost libraries installed on the system.
+                               boost-thread is the only non-header-only library
+                               required.
+          - source - Build the boost libraries from source. If this option is
+                     selected the envirment variable BOOST_ROOT must be set to
+                     the path of the boost source tree.
+
+use-torrent - system - Use the libtorrent library installed on the system.
+            - source (default) - Build libtorrent from source. If this option
+                       is selected the envirment variable TORRENT_ROOT must be
+                       set to the path of the libtorrent source tree.
+
+use-sqlite - system (default) - Use the sqlite library installed on the system.
+           - source - Build sqlite from source. If this option is selected the
+                      envirment variable SQLITE_PATH must be set to the path of
+                      the sqlite source file.
+
+Other options of interest:
+
+link - shared (default) - Build a shared library (so or dll).
+     - static - Build a static library (a or lib).
+
+variant - debug (default) - Build with debug information.
+        - release - Build with optimization.

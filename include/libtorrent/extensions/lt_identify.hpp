@@ -55,6 +55,7 @@ namespace libtorrent
 struct lt_identify_crypto_plugin;
 struct bt_peer_connection_handle;
 
+// represents an ed25519 key pair
 struct lt_identify_keypair
 {
 	boost::array<char, 64> sk;
@@ -63,17 +64,22 @@ struct lt_identify_keypair
 
 struct lt_identify_peer_plugin : peer_plugin
 {
+	// internal
 	lt_identify_peer_plugin(lt_identify_keypair const& key, bt_peer_connection_handle const& pc);
 
 	virtual char const* type() const { return "lt_identify"; }
 
+	// internal
 	virtual void add_handshake(entry& h);
 
+	// internal
 	virtual bool on_extension_handshake(bdecode_node const& h);
 	void maybe_send_identify();
 	virtual bool on_extended(int length, int msg_id
 		, buffer::const_interval body);
 
+	// returns the peer's public key
+	// returns NULL if the peer's key is not yet known
 	boost::array<char, 32> const* peer_key() const
 	{
 		if (m_got_identify)
@@ -82,11 +88,16 @@ struct lt_identify_peer_plugin : peer_plugin
 			return NULL;
 	}
 
+	// takes a BEP10 extension handshake and returns true if it indicates
+	// that this extension is supported
 	static bool supports_extension(bdecode_node const& h)
 	{
 		return get_message_index(h) != 0;
 	}
 
+	// register a callback to be invoked when the peer's identity is known
+	// the callback may be invoked within this function if the peer's identity
+	// is already known
 	void notify_on_identified(boost::function<void(lt_identify_peer_plugin const&)> cb) const
 	{
 		if (m_got_identify)
@@ -113,9 +124,13 @@ private:
 
 struct TORRENT_REPUTATION_EXPORT lt_identify_plugin : plugin
 {
+	// populate key with a random key pair
 	void create_keypair();
+	// populate key using the given prng seed
 	void create_keypair(boost::array<unsigned char, 32> const& seed);
+	// internal
 	virtual boost::shared_ptr<torrent_plugin> new_torrent(torrent_handle const&, void*);
+	// the key pair to use as the client's identity
 	lt_identify_keypair key;
 };
 
