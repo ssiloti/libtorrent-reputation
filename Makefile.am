@@ -1,6 +1,6 @@
 ACLOCAL_AMFLAGS = -I m4 --install
 
-AM_CXXFLAGS = $(DEPS_CFLAGS) -I./include
+AM_CXXFLAGS = $(DEPS_CFLAGS) -I./include -std=c++11
 
 lib_LTLIBRARIES = libtorrent-reputation.la
 

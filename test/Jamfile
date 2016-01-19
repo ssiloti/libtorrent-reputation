@@ -65,6 +65,7 @@ lib libtorrent_test
 	../src/lt_identify.cpp
 
 	: # requirements
+	<toolset>gcc:<cxxflags>-std=c++11
 	# this is used to determine whether
 	# symbols are exported or imported
 	<link>shared:<define>TORRENT_BUILDING_TEST_SHARED
