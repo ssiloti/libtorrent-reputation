@@ -807,10 +807,17 @@ namespace
 			i->m_impl->rep->on_interested();
 			ppeers.push_back(*i);
 		}
+
+		// add two dummy entries so that the test peers are in the upper half of the vector
+		ppeers.push_back((bt_peer_connection_mock_impl*)NULL);
+		ppeers.push_back((bt_peer_connection_mock_impl*)NULL);
+
 		tc.repman().on_optimistic_unchoke(ppeers);
-		TEST_EQUAL(ppeers.size(), 2);
+		TEST_EQUAL(ppeers.size(), 4);
 		TEST_EQUAL(ppeers[0].m_impl, peers[1].m_impl);
 		TEST_EQUAL(ppeers[1].m_impl, peers[0].m_impl);
+		TEST_EQUAL(ppeers[2].m_impl, (bt_peer_connection_mock_impl*)NULL);
+		TEST_EQUAL(ppeers[3].m_impl, (bt_peer_connection_mock_impl*)NULL);
 
 		return 0;
 	}

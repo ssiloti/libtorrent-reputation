@@ -4555,11 +4555,12 @@ namespace
 
 	bool reputation_manager::on_optimistic_unchoke(std::vector<peer_connection_handle>& peers)
 	{
+		// only rank the top half of the vector to avoid unchoking peers too frequently
 		std::vector<std::pair<double, peer_connection_handle> > peer_reps;
-		peer_reps.reserve(peers.size());
+		peer_reps.reserve(peers.size() / 2);
 
-		for (std::vector<peer_connection_handle>::iterator p = peers.begin();
-			p != peers.end(); ++p)
+		for (std::vector<peer_connection_handle>::iterator p = peers.begin()
+			, end = peers.begin() + peers.size() / 2; p != end; ++p)
 		{
 			double rep = 0.0;
 			reputation_peer_plugin const* peer_rep
