@@ -30,8 +30,6 @@ POSSIBILITY OF SUCH DAMAGE.
 
 */
 
-#include <random>
-
 #ifdef _MSC_VER
 #pragma warning(push, 1)
 #endif
@@ -233,12 +231,9 @@ lt_identify_peer_plugin::lt_identify_peer_plugin(lt_identify_keypair const& sp
 	, m_sent_identify(false)
 	, m_got_identify(false)
 {
-	static std::random_device dev;
-	static std::uniform_int_distribution<short> dist(
-		std::numeric_limits<char>::min()
-		, std::numeric_limits<char>::max());
-	for (int i=0; i < nonce_size; ++i)
-		m_nonce[i] = char(dist(dev));
+	unsigned char nonce_seed[ed25519_seed_size];
+	ed25519_create_seed(nonce_seed);
+	memcpy(m_nonce, nonce_seed, nonce_size);
 }
 
 void lt_identify_peer_plugin::add_handshake(entry& h)
