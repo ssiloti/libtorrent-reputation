@@ -16,7 +16,12 @@ else
 	lib boost_thread : : <name>boost_thread <link>shared ;
 }
 
-lib sqlite : : <name>sqlite3 ;
+SQLITE_PATH = [ modules.peek : SQLITE_PATH ] ;
+
+if ! $(SQLITE_PATH)
+{
+	lib sqlite : : <name>sqlite3 ;
+}
 
 rule link_test ( properties * )
 {
@@ -31,6 +36,7 @@ rule link_test ( properties * )
 		result +=
 			<library>libtorrent_test/<link>static ;
 	}
+
 	return $(result) ;
 }
 
@@ -47,6 +53,17 @@ rule link_libtorrent ( properties * )
 		result +=
 			<library>/torrent//torrent/<link>static/<logging>on/<boost-link>static/<export-extra>on/<debug-iterators>on ;
 	}
+
+	if $(SQLITE_PATH)
+	{
+		result += <source>$(SQLITE_PATH)/sqlite3.c ;
+		result += <include>$(SQLITE_PATH) ;
+	}
+	else
+	{
+		result += <library>sqlite/<link>shared ;
+	}
+
 	return $(result) ;
 }
 
@@ -62,10 +79,9 @@ lib libtorrent_test
 	test.cpp
 	../src/chacha20poly1305/$(CHACHA20POLY1305_SOURCES).cpp
 	../src/sha256.cpp
-	../src/lt_identify.cpp
+#	../src/lt_identify.cpp
 
 	: # requirements
-	<toolset>gcc:<cxxflags>-std=c++11
 	# this is used to determine whether
 	# symbols are exported or imported
 	<link>shared:<define>TORRENT_BUILDING_TEST_SHARED
@@ -97,7 +113,6 @@ project
 	<conditional>@link_test
 	<conditional>@link_libtorrent
 	<toolset>darwin:<cflags>-Wno-unused-command-line-argument
-	<library>sqlite/<link>shared
 	<library>boost_thread
 	<include>$(TORRENT_ROOT)/ed25519/src
 	<include>../include

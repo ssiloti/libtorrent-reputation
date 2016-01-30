@@ -30,31 +30,88 @@ POSSIBILITY OF SUCH DAMAGE.
 
 */
 
-#include "libtorrent/session.hpp"
+#define TORRENT_SESSION_HPP_INCLUDED
+#define TORRENT_PEER_CONNECTION_HANDLE_HPP_INCLUDED
+#define TORRENT_BT_PEER_CONNECTION_HPP_INCLUDED
+#define TORRENT_LT_IDENTIFY_HPP_INCLUDED
+//#include "libtorrent/session.hpp"
 #include "test.hpp"
 
-#include "libtorrent/extensions/lt_identify.hpp"
-#include "libtorrent/extensions/reputation_manager.hpp"
-#include "libtorrent/peer_connection_interface.hpp"
+//#include "libtorrent/extensions/lt_identify.hpp"
+//#include "libtorrent/extensions/reputation_manager.hpp"
+#include <libtorrent/peer_connection_interface.hpp>
+#include <libtorrent/extensions.hpp>
 
 // any headers which reference peer_connection must be included before the
 // mockups to avoid ambiguous references
 //#include <libtorrent/session_handle.hpp>
 #include <libtorrent/kademlia/msg.hpp>
 #include <libtorrent/kademlia/item.hpp>
-#include <libtorrent/peer_connection_handle.hpp>
-#include <libtorrent/bt_peer_connection.hpp> // for bt_peer_connection::msg_extended
+//#include <libtorrent/peer_connection_handle.hpp>
+//#include <libtorrent/bt_peer_connection.hpp> // for bt_peer_connection::msg_extended
 #include <libtorrent/sha1_hash.hpp>
 #include <libtorrent/io.hpp>
 #include <libtorrent/bdecode.hpp>
 #include <libtorrent/bencode.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/session_status.hpp>
+#include <libtorrent/ed25519.hpp>
 
 #include <libtorrent/alert_manager.hpp>
 
 namespace libtorrent
 {
+
+	struct lt_identify_keypair
+	{
+		boost::array<char, 64> sk;
+		boost::array<char, 32> pk;
+	};
+
+	struct lt_identify_peer_plugin : peer_plugin
+	{
+		lt_identify_peer_plugin(boost::array<char, 32> const& k)
+			: pk(k)
+		{}
+
+		static bool supports_extension(bdecode_node const&)
+		{
+			return true;
+		}
+
+		boost::array<char, 32> const* peer_key() const
+		{
+			return &pk;
+		}
+
+		void notify_on_identified(boost::function<void(lt_identify_peer_plugin const&)> cb) const
+		{
+			cb(*this);
+		}
+
+		boost::array<char, 32> const& pk;
+	};
+
+	struct lt_identify_plugin : plugin
+	{
+		// populate key with a random key pair
+		void create_keypair()
+		{
+			boost::array<unsigned char, 32> seed;
+			ed25519_create_seed(seed.data());
+			create_keypair(seed);
+		}
+
+		// populate key using the given prng seed
+		void create_keypair(boost::array<unsigned char, 32> const& seed)
+		{
+			ed25519_create_keypair((unsigned char*)key.pk.data()
+				, (unsigned char*)key.sk.data(), seed.data());
+		}
+
+		// the key pair to use as the client's identity
+		lt_identify_keypair key;
+	};
 
 namespace
 {
@@ -69,26 +126,6 @@ namespace
 
 //	time_point const& time_now() { return current_time; }
 
-	struct lt_identify_peer_plugin : peer_plugin
-	{
-		lt_identify_peer_plugin(boost::array<char, 32> const& k)
-			: pk(k)
-		{}
-
-		static bool supports_extension(bdecode_node const&)
-		{ return true; }
-
-		boost::array<char, 32> const* peer_key() const
-		{ return &pk; }
-
-		void notify_on_identified(boost::function<void(lt_identify_peer_plugin const&)> cb) const
-		{
-			cb(*this);
-		}
-
-		boost::array<char, 32> const& pk;
-	};
-
 	class reputation_peer_plugin;
 
 	struct torrent_handle
@@ -96,6 +133,7 @@ namespace
 		static const boost::uint32_t query_accurate_download_counters = 1;
 
 		torrent_handle(boost::int64_t size, boost::int64_t done, torrent_status::state_t state)
+			: m_down_limit(0)
 		{
 			m_status.total_wanted_done = done;
 			m_status.total_wanted = size;
@@ -111,6 +149,21 @@ namespace
 
 		torrent_status m_status;
 		int m_down_limit;
+	};
+
+	struct bt_peer_connection
+	{
+		enum { msg_extended = 20 };
+	};
+
+	struct peer_connection
+	{
+		enum connection_type
+		{
+			bittorrent_connection = 0,
+			url_seed_connection = 1,
+			http_seed_connection = 2
+		};
 	};
 
 	struct bt_peer_connection_mock_impl
@@ -134,13 +187,6 @@ namespace
 
 	struct bt_peer_connection_handle
 	{
-		enum connection_type
-		{
-			bittorrent_connection = 0,
-			url_seed_connection = 1,
-			http_seed_connection = 2
-		};
-
 		bt_peer_connection_handle(bt_peer_connection_mock_impl* impl)
 			: m_impl(impl)
 		{}
@@ -150,7 +196,7 @@ namespace
 		bool ignore_unchoke_slots() const { return false; }
 		void choke_this_peer() { m_impl->sent_chokes++; }
 
-		int type() const { return bittorrent_connection; }
+		int type() const { return peer_connection::bittorrent_connection; }
 
 		bool is_choked() { return m_impl->choked; }
 		bool is_interesting() { return m_impl->interesting; }
@@ -335,6 +381,7 @@ namespace
 	}
 
 } // namespace
+
 } // namespace libtorrent
 
 #define TORRENT_DISABLE_LOGGING
@@ -1519,6 +1566,7 @@ namespace
 
 		tp.con.interesting = true;
 		tp.con.peer_choked = true;
+		tc.ses->m_settings.set_int(settings_pack::download_rate_limit, 0);
 
 		{
 			// send known_peers to the test client
