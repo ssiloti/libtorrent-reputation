@@ -673,7 +673,7 @@ namespace
 		, boost::array<boost::uint8_t, 32>& key)
 	{
 		boost::array<boost::uint8_t, 4> const i = {0,0,0,1};
-		boost::array<boost::uint8_t, 512> mac_key = {0};
+		boost::array<boost::uint8_t, 64> mac_key = {0};
 
 		if (pw.size() > mac_key.size())
 		{
@@ -685,7 +685,7 @@ namespace
 		else
 			std::copy(pw.begin(), pw.end(), mac_key.begin());
 
-		boost::array<boost::uint8_t, 512> ikey, okey;
+		boost::array<boost::uint8_t, 64> ikey, okey;
 		std::transform(mac_key.begin(), mac_key.end(), ikey.begin()
 			, boost::bind(std::bit_xor<boost::uint8_t>(), 0x36, _1));
 		std::transform(mac_key.begin(), mac_key.end(), okey.begin()
@@ -703,13 +703,13 @@ namespace
 		Sha256_Update(&digest, key.data(), key.size());
 		Sha256_Final(&digest, key.data());
 
-		for (int i = 0; i < 4096; ++i)
-		{
-			boost::array<boost::uint8_t, 32> u;
+		boost::array<boost::uint8_t, 32> u = key;
 
+		for (int round = 1; round < 16384; ++round)
+		{
 			Sha256_Init(&digest);
 			Sha256_Update(&digest, ikey.data(), ikey.size());
-			Sha256_Update(&digest, key.data(), key.size());
+			Sha256_Update(&digest, u.data(), u.size());
 			Sha256_Final(&digest, u.data());
 
 			Sha256_Init(&digest);
