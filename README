@@ -10,11 +10,13 @@ boost >= 1.47
 
 Example usage:
 
-using namespace libtorrent;
+namespace lt = libtorrent;
 
-session ses;
-reputation_handle reputation;
-boost::shared_ptr<lt_identify_plugin> identify_plugin = boost::make_shared<lt_identify_plugin>();
-ses.add_extension(boost::shared_ptr<plugin>(identify_plugin));
-reputation = create_reputation_plugin(*identify_plugin, client_configuration_diractory, user_password);
+lt::session ses;
+lt::reputation_handle reputation;
+boost::shared_ptr<lt::lt_identify_plugin> identify_plugin = boost::make_shared<lt::lt_identify_plugin>();
+ses.add_extension(boost::shared_ptr<lt::plugin>(identify_plugin));
+reputation = create_reputation_plugin(*identify_plugin, <client_configuration_directory>, <user_password>);
 ses.add_extension(reputation.reputation_plugin);
+
+An sqlite databse will be created in the provided configuration directory with the private key encrypted by the given password. The password can be blank if the user has not configured one.
