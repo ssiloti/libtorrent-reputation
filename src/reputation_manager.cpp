@@ -194,6 +194,14 @@ namespace
 	};
 	enum { receipt_interval_bytes = 1024*1024*10 };
 
+	void incoming_error(entry& e, char const* msg, int error_code = 203)
+	{
+		e["y"] = "e";
+		entry::list_type& l = e["e"].list();
+		l.push_back(entry(error_code));
+		l.push_back(entry(msg));
+	}
+
 	/*
 	 * Some common shorthand for various peer identifiers:
 	 * pkey, pk - an ed25519 public key
