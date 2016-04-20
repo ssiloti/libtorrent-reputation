@@ -1,6 +1,8 @@
 import modules ;
 import feature : feature ;
 import virtual-target ;
+import path ;
+import package ;
 
 BOOST_ROOT = [ modules.peek : BOOST_ROOT ] ;
 TORRENT_ROOT = [ modules.peek : TORRENT_ROOT ] ;
@@ -79,4 +81,13 @@ lib torrent-reputation
 	: # usage requirements
 	<include>./include
 	<link>shared:<define>TORRENT_REPUTATION_LINKING_SHARED
+	;
+
+headers = [ path.glob-tree include/libtorrent : *.hpp ] ;
+
+package.install install
+	: <install-source-root>torrent-reputation
+	:
+	: torrent-reputation
+	: $(headers)
 	;
