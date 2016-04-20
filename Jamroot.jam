@@ -24,7 +24,7 @@ if $(TORRENT_ROOT)
 VERSION = 0.0.0 ;
 
 feature use-boost : system source : composite ;
-feature use-torrent : source system : composite ;
+feature use-torrent : system source : composite ;
 feature use-sqlite : system source : composite ;
 
 lib sqlite : : <name>sqlite3 ;
