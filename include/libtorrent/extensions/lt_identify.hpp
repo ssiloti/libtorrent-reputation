@@ -37,8 +37,9 @@ POSSIBILITY OF SUCH DAMAGE.
 #pragma warning(push, 1)
 #endif
 
-#include <boost/shared_ptr.hpp>
-#include <boost/function.hpp>
+#include <memory>
+#include <functional>
+#include <array>
 
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -46,11 +47,15 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include <libtorrent/extensions.hpp>
 #include <libtorrent/peer_connection_handle.hpp>
+#include <libtorrent/kademlia/types.hpp>
 
 #include "libtorrent/extensions/reputation_export.hpp"
 
 namespace libtorrent
 {
+
+struct bdecode_node;
+class entry;
 
 struct lt_identify_crypto_plugin;
 struct bt_peer_connection_handle;
@@ -58,8 +63,8 @@ struct bt_peer_connection_handle;
 // represents an ed25519 key pair
 struct lt_identify_keypair
 {
-	boost::array<char, 64> sk;
-	boost::array<char, 32> pk;
+	dht::secret_key sk;
+	dht::public_key pk;
 };
 
 struct lt_identify_peer_plugin : peer_plugin
@@ -67,20 +72,19 @@ struct lt_identify_peer_plugin : peer_plugin
 	// internal
 	lt_identify_peer_plugin(lt_identify_keypair const& key, bt_peer_connection_handle const& pc);
 
-	virtual char const* type() const { return "lt_identify"; }
+	string_view type() const override { return "lt_identify"; }
 
 	// internal
-	virtual void add_handshake(entry& h);
+	void add_handshake(entry& h) override;
 
 	// internal
-	virtual bool on_extension_handshake(bdecode_node const& h);
+	bool on_extension_handshake(bdecode_node const& h) override;
 	void maybe_send_identify();
-	virtual bool on_extended(int length, int msg_id
-		, buffer::const_interval body);
+	bool on_extended(int length, int msg_id, span<char const> body) override;
 
 	// returns the peer's public key
 	// returns NULL if the peer's key is not yet known
-	boost::array<char, 32> const* peer_key() const
+	dht::public_key const* peer_key() const
 	{
 		if (m_got_identify)
 			return &m_peer_pk;
@@ -98,7 +102,7 @@ struct lt_identify_peer_plugin : peer_plugin
 	// register a callback to be invoked when the peer's identity is known
 	// the callback may be invoked within this function if the peer's identity
 	// is already known
-	void notify_on_identified(boost::function<void(lt_identify_peer_plugin const&)> cb) const
+	void notify_on_identified(std::function<void(lt_identify_peer_plugin const&)> cb) const
 	{
 		if (m_got_identify)
 			cb(*this);
@@ -113,13 +117,13 @@ private:
 
 	lt_identify_keypair const& m_kp;
 	bt_peer_connection_handle m_pc;
-	boost::shared_ptr<lt_identify_crypto_plugin> m_cp;
-	boost::array<char, 32> m_peer_pk;
-	char m_nonce[nonce_size];
+	std::shared_ptr<lt_identify_crypto_plugin> m_cp;
+	dht::public_key m_peer_pk;
+	std::array<char, nonce_size> m_nonce;
 	int m_message_index;
 	bool m_sent_identify:1;
 	bool m_got_identify:1;
-	mutable std::vector<boost::function<void(lt_identify_peer_plugin const&)> > m_got_id_notifiers;
+	mutable std::vector<std::function<void(lt_identify_peer_plugin const&)> > m_got_id_notifiers;
 };
 
 struct TORRENT_REPUTATION_EXPORT lt_identify_plugin : plugin
@@ -127,9 +131,9 @@ struct TORRENT_REPUTATION_EXPORT lt_identify_plugin : plugin
 	// populate key with a random key pair
 	void create_keypair();
 	// populate key using the given prng seed
-	void create_keypair(boost::array<unsigned char, 32> const& seed);
+	void create_keypair(std::array<char, 32> const& seed);
 	// internal
-	virtual boost::shared_ptr<torrent_plugin> new_torrent(torrent_handle const&, void*);
+	std::shared_ptr<torrent_plugin> new_torrent(torrent_handle const&, void*) override;
 	// the key pair to use as the client's identity
 	lt_identify_keypair key;
 };

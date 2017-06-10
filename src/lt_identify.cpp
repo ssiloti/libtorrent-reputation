@@ -34,6 +34,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #pragma warning(push, 1)
 #endif
 
+#include <boost/system/error_code.hpp>
 #include <boost/shared_ptr.hpp>
 #include <boost/bind.hpp>
 #include <boost/detail/endian.hpp>
@@ -47,7 +48,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/io.hpp"
 #include "sha256.hpp"
 #include "libtorrent/extensions/lt_identify.hpp"
-#include "libtorrent/ed25519.hpp"
+#include "libtorrent/kademlia/ed25519.hpp"
 
 #include "chacha20poly1305/chacha20poly1305.hpp"
 
@@ -126,77 +127,75 @@ namespace
 
 struct lt_identify_crypto_plugin : crypto_plugin
 {
-	lt_identify_crypto_plugin(bool is_outgoing)
-	: local_nonce(is_outgoing ? 1 : 2)
-	, remote_nonce(is_outgoing ? 2 : 1)
-	, can_encrypt(false)
-	{}
+	explicit lt_identify_crypto_plugin(bool is_outgoing)
+		: local_nonce(is_outgoing ? 1 : 2)
+		, remote_nonce(is_outgoing ? 2 : 1)
+		, header_buf((char*)&header, sizeof(header))
+		, can_encrypt(false)
+		{}
 
-	virtual void set_incoming_key(unsigned char const* key, int len)
+	void set_incoming_key(span<char const> key) override
 	{
-		TORRENT_ASSERT(len == crypto_secretbox_KEYBYTES);
-		memcpy(this->key, key, crypto_secretbox_KEYBYTES);
+		TORRENT_ASSERT(key.size() == crypto_secretbox_KEYBYTES);
+		std::copy(key.begin(), key.end(), m_key.begin());
 		can_encrypt = true;
 	}
 
-	virtual void set_outgoing_key(unsigned char const* key, int len)
-	{ set_incoming_key(key, len); }
+	void set_outgoing_key(span<char const> key) override
+	{ set_incoming_key(key); }
 
-	virtual int encrypt(std::vector<boost::asio::mutable_buffer>& vec)
+	std::tuple<int, span<span<char const>>>
+	encrypt(span<span<char>> vec) override
 	{
-		if (!can_encrypt) { vec.clear(); return 0; }
+		if (!can_encrypt) { return {}; }
 
 		unsigned char nonce[crypto_secretbox_NONCEBYTES];
 		htol(local_nonce, nonce);
-		int produce = crypto_secretbox(vec, header.tag, nonce, key);
+		int produce = crypto_secretbox(vec, header.tag, nonce, (unsigned char*)m_key.data());
 		unsigned char* psize = header.length;
 		detail::write_uint32(produce + sizeof(header.tag), psize);
-		vec.resize(1);
-		vec[0] = boost::asio::mutable_buffer(header.all, sizeof(header));
 		local_nonce += 2;
-		return produce + sizeof(header);
+		return { int(produce + sizeof(header)), header_buf };
 	}
 
 	// the header must not be split across buffers
 	// TODO: how does the caller know the size of the header?
-	virtual void decrypt(std::vector<boost::asio::mutable_buffer>& vec
-		, int& consume, int& produce, int& packet_size)
+	std::tuple<int, int, int>
+	decrypt(span<span<char>> vec) override
 	{
 		namespace asio = boost::asio;
 
 		TORRENT_ASSERT(can_encrypt);
-		produce = 0;
-		packet_size = sizeof(header);
-		if (vec.empty())
-			return;
-		TORRENT_ASSERT(asio::buffer_size(vec[0]) >= sizeof(header));
-		unsigned char* recv_buffer = asio::buffer_cast<unsigned char*>(vec[0]);
+		int produce = 0;
+		int packet_size = sizeof(header);
+		if (vec.size() == 0)
+			return {0, produce, packet_size};
+		TORRENT_ASSERT(vec[0].size() >= sizeof(header));
+		auto recv_buffer = vec[0].begin();
 		packet_size = detail::read_int32(recv_buffer) + sizeof(header.length);
-		if (asio::buffer_size(vec[0]) == sizeof(header) && vec.size() == 1)
-			return;
-		unsigned char* tag = recv_buffer;
-		vec[0] = vec[0] + sizeof(header);
-		if (asio::buffer_size(vec[0]) == 0)
-			vec.erase(vec.begin());
+		if (vec[0].size() == sizeof(header) && vec.size() == 1)
+			return {0, produce, packet_size};
+		auto tag = recv_buffer;
+		vec[0] = vec[0].subspan(sizeof(header));
+		if (vec[0].size() == 0)
+			vec = vec.subspan(1);
 		unsigned char nonce[crypto_secretbox_NONCEBYTES];
 		htol(remote_nonce, nonce);
-		produce = crypto_secretbox_open(vec, tag, nonce, key);
-		consume = sizeof(header);
-		packet_size = sizeof(header);
+		produce = crypto_secretbox_open(vec, (unsigned char*)&*tag, nonce, (unsigned char*)m_key.data());
+		int consume = int(sizeof(header));
+		packet_size = int(sizeof(header));
 		remote_nonce += 2;
+		return {consume, produce, packet_size};
 	}
 
-	unsigned char key[crypto_secretbox_KEYBYTES];
+	std::array<char, crypto_secretbox_KEYBYTES> m_key;
 	boost::uint64_t local_nonce, remote_nonce;
-	union
+	struct
 	{
-		unsigned char all[sizeof(uint32_t)+POLY1305_TAGLEN];
-		struct
-		{
-			unsigned char length[sizeof(uint32_t)];
-			unsigned char tag[POLY1305_TAGLEN];
-		};
+		unsigned char length[sizeof(uint32_t)];
+		unsigned char tag[POLY1305_TAGLEN];
 	} header;
+	span<char const> header_buf;
 	bool can_encrypt;
 };
 
@@ -208,14 +207,14 @@ namespace
 		: m_kp(sp)
 		{}
 
-		virtual boost::shared_ptr<peer_plugin> new_connection(
-			peer_connection_handle const& pc)
+		std::shared_ptr<peer_plugin> new_connection(
+			peer_connection_handle const& pc) override
 		{
-			if (pc.type() != peer_connection::bittorrent_connection)
-				return boost::shared_ptr<peer_plugin>();
+			if (pc.type() != connection_type::bittorrent)
+				return std::shared_ptr<peer_plugin>();
 
 			bt_peer_connection_handle c(pc);
-			return boost::shared_ptr<peer_plugin>(new lt_identify_peer_plugin(m_kp, c));
+			return std::shared_ptr<peer_plugin>(new lt_identify_peer_plugin(m_kp, c));
 		}
 
 	private:
@@ -231,9 +230,8 @@ lt_identify_peer_plugin::lt_identify_peer_plugin(lt_identify_keypair const& sp
 	, m_sent_identify(false)
 	, m_got_identify(false)
 {
-	unsigned char nonce_seed[ed25519_seed_size];
-	ed25519_create_seed(nonce_seed);
-	memcpy(m_nonce, nonce_seed, nonce_size);
+	auto nonce_seed = dht::ed25519_create_seed();
+	std::copy_n(nonce_seed.begin(), m_nonce.size(), m_nonce.begin());
 }
 
 void lt_identify_peer_plugin::add_handshake(entry& h)
@@ -248,7 +246,7 @@ bool lt_identify_peer_plugin::on_extension_handshake(bdecode_node const& h)
 	if (m_message_index == 0)
 		return false;
 
-	m_cp = boost::make_shared<lt_identify_crypto_plugin>(m_pc.is_outgoing());
+	m_cp = std::make_shared<lt_identify_crypto_plugin>(m_pc.is_outgoing());
 
 	maybe_send_identify();
 	return true;
@@ -266,8 +264,8 @@ void lt_identify_peer_plugin::maybe_send_identify()
 #endif
 
 	entry e;
-	e["pk"] = std::string(m_kp.pk.data(), m_kp.pk.size());
-	e["nonce"] = std::string(m_nonce, nonce_size);
+	e["pk"] = m_kp.pk.bytes;
+	e["nonce"] = m_nonce;
 
 	char msg[128];
 	char* header = msg;
@@ -284,14 +282,14 @@ void lt_identify_peer_plugin::maybe_send_identify()
 }
 
 bool lt_identify_peer_plugin::on_extended(int length, int msg_id
-	, buffer::const_interval body)
+	, span<char const> body)
 {
 	if (msg_id != 9) return false;
 	if (m_cp->can_encrypt) return true;
 	if (!m_pc.packet_finished()) return true;
 
-	int len;
-	entry msg = bdecode(body.begin, body.end, len);
+	ptrdiff_t len;
+	entry msg = bdecode(body.begin(), body.end(), len);
 	if (msg.type() != entry::dictionary_t)
 	{
 #ifndef TORRENT_DISABLE_LOGGING
@@ -305,7 +303,7 @@ bool lt_identify_peer_plugin::on_extended(int length, int msg_id
 	entry const* nonce_ent = msg.find_key("nonce");
 	if (pk_ent == 0
 		|| pk_ent->type() != entry::string_t
-		|| pk_ent->string().size() != m_peer_pk.size()
+		|| pk_ent->string().size() != m_peer_pk.len
 		|| nonce_ent == 0
 		|| nonce_ent->type() != entry::string_t
 		|| nonce_ent->string().size() != nonce_size)
@@ -321,41 +319,38 @@ bool lt_identify_peer_plugin::on_extended(int length, int msg_id
 	m_pc.peer_log(peer_log_alert::incoming_message, "LT_IDENTIFY");
 #endif
 
-	memcpy(m_peer_pk.data(), pk_ent->string().data(), m_peer_pk.size());
+	auto pk_ent_str = pk_ent->string();
+	std::copy(pk_ent_str.begin(), pk_ent_str.end(), m_peer_pk.bytes.begin());
 	struct
 	{
-		unsigned char shared_secret[ed25519_shared_secret_size];
-		unsigned char outgoing_nonce[nonce_size];
-		unsigned char incoming_nonce[nonce_size];
+		std::array<char, 32> shared_secret;
+		std::array<char, nonce_size> outgoing_nonce;
+		std::array<char, nonce_size> incoming_nonce;
 	} key_iv;
-	ed25519_key_exchange(key_iv.shared_secret
-		, (unsigned char*)m_peer_pk.data()
-		, (unsigned char*)m_kp.sk.data());
+	key_iv.shared_secret = dht::ed25519_key_exchange(m_peer_pk, m_kp.sk);
 
 	if (m_pc.is_outgoing())
 	{
-		memcpy(key_iv.outgoing_nonce, m_nonce, nonce_size);
-		memcpy(key_iv.incoming_nonce, nonce_ent->string().data(), nonce_size);
+		key_iv.outgoing_nonce = m_nonce;
+		std::copy_n(nonce_ent->string().begin(), nonce_size, key_iv.incoming_nonce.begin());
 	}
 	else
 	{
-		memcpy(key_iv.outgoing_nonce, nonce_ent->string().data(), nonce_size);
-		memcpy(key_iv.incoming_nonce, m_nonce, nonce_size);
+		key_iv.incoming_nonce = m_nonce;
+		std::copy_n(nonce_ent->string().begin(), nonce_size, key_iv.outgoing_nonce.begin());
 	}
 
-	unsigned char key[crypto_secretbox_KEYBYTES];
+	std::array<char, crypto_secretbox_KEYBYTES> key;
 	CSha256 p;
 	Sha256_Init(&p);
 	Sha256_Update(&p, (unsigned char*)&key_iv, sizeof(key_iv));
-	Sha256_Final(&p, key);
-	m_cp->set_incoming_key(key, crypto_secretbox_KEYBYTES);
+	Sha256_Final(&p, (unsigned char*)key.data());
+	m_cp->set_incoming_key(key);
 	m_pc.switch_recv_crypto(m_cp);
 	m_got_identify = true;
 
-	for (std::vector<boost::function<void(lt_identify_peer_plugin const&)> >::iterator
-		i = m_got_id_notifiers.begin();
-		i != m_got_id_notifiers.end(); ++i)
-		(*i)(*this);
+	for (auto& n : m_got_id_notifiers)
+		n(*this);
 	m_got_id_notifiers.clear();
 
 	return true;
@@ -374,19 +369,20 @@ int lt_identify_peer_plugin::get_message_index(bdecode_node const& h)
 
 void lt_identify_plugin::create_keypair()
 {
-	boost::array<unsigned char, ed25519_seed_size> seed;
-	ed25519_create_seed(seed.data());
+	auto seed = dht::ed25519_create_seed();
 	create_keypair(seed);
 }
 
-void lt_identify_plugin::create_keypair(boost::array<unsigned char, ed25519_seed_size> const& seed)
+void lt_identify_plugin::create_keypair(std::array<char, 32> const& seed)
 {
-	ed25519_create_keypair((unsigned char*)key.pk.data(), (unsigned char*)key.sk.data(), seed.data());
+	auto kp = dht::ed25519_create_keypair(seed);
+	key.pk = std::get<0>(kp);
+	key.sk = std::get<1>(kp);
 }
 
-boost::shared_ptr<torrent_plugin> lt_identify_plugin::new_torrent(torrent_handle const&, void*)
+std::shared_ptr<torrent_plugin> lt_identify_plugin::new_torrent(torrent_handle const&, void*)
 {
-	return boost::make_shared<lt_identify_torrent_plugin>(this->key);
+	return std::make_shared<lt_identify_torrent_plugin>(this->key);
 }
 
 } // namespace libtorrent

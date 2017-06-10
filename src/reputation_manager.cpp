@@ -40,9 +40,6 @@ POSSIBILITY OF SUCH DAMAGE.
 #pragma warning(push, 1)
 #endif
 
-#include <boost/tuple/tuple.hpp>
-#include <boost/make_shared.hpp>
-#include <boost/bind.hpp>
 #include <boost/thread/condition_variable.hpp>
 
 #ifdef _MSC_VER
@@ -61,12 +58,15 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <libtorrent/io.hpp>
 #include <libtorrent/bdecode.hpp>
 #include <libtorrent/bencode.hpp>
+#include <libtorrent/entry.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/session_status.hpp>
-#include <libtorrent/ed25519.hpp>
+#include <libtorrent/kademlia/ed25519.hpp>
 
 #include "sha256.hpp"
 #include "chacha20poly1305/chacha.hpp"
+
+using namespace std::placeholders;
 
 /*
  * The reputation extension has four main classes:
@@ -138,10 +138,10 @@ namespace libtorrent
 {
 	struct reputation_error_category : boost::system::error_category
 	{
-		virtual const char* name() const BOOST_SYSTEM_NOEXCEPT;
-		virtual std::string message(int ev) const BOOST_SYSTEM_NOEXCEPT;
-		virtual boost::system::error_condition default_error_condition(
-			int ev) const BOOST_SYSTEM_NOEXCEPT
+		const char* name() const BOOST_SYSTEM_NOEXCEPT override;
+		std::string message(int ev) const BOOST_SYSTEM_NOEXCEPT override;
+		boost::system::error_condition default_error_condition(
+			int ev) const BOOST_SYSTEM_NOEXCEPT override
 		{ return boost::system::error_condition(ev, *this); }
 	};
 
@@ -211,14 +211,12 @@ namespace
 
 	typedef sha1_hash reputation_id;
 	typedef sqlite_int64 reputation_key;
-	typedef boost::array<char, ed25519_signature_size> signature_type;
-	typedef boost::array<char, ed25519_public_key_size> pubkey_type;
 
 	struct reputation_exception : std::exception
 	{
 		reputation_exception(std::string const& w) : m_what(w) {}
-		virtual char const* what() const throw() { return m_what.c_str(); }
-		virtual ~reputation_exception() throw() {}
+		char const* what() const noexcept override { return m_what.c_str(); }
+		~reputation_exception() noexcept override {}
 	private:
 		std::string m_what;
 	};
@@ -228,7 +226,7 @@ namespace
 	bool rid_from_entry(reputation_id& dest, bdecode_node const& e, char const* name)
 	{
 		bdecode_node elm = e.dict_find_string(name);
-		if (!elm || elm.string_length() != reputation_id::size)
+		if (!elm || elm.string_length() != reputation_id::size())
 			return false;
 		dest.assign(elm.string_ptr());
 		return true;
@@ -239,7 +237,7 @@ namespace
 		entry::dictionary_type::const_iterator elm = e.find(name);
 		if (elm == e.end()
 			|| elm->second.type() != entry::string_t
-			|| elm->second.string().length() != reputation_id::size)
+			|| elm->second.string().length() != reputation_id::size())
 			return false;
 		dest.assign(elm->second.string().data());
 		return true;
@@ -279,19 +277,19 @@ namespace
 
 		reputation_id subject;
 		// bytes of piece data sent directly from the client to the peer
-		boost::int64_t upload_direct;
+		std::int64_t upload_direct;
 		// bytes of piece data sent directly from the peer to the client
-		boost::int64_t download_direct;
+		std::int64_t download_direct;
 		// bytes of piece data sent to other peers due to this peer's
 		// recommendation as the intermediary
-		boost::int64_t upload_recommended;
+		std::int64_t upload_recommended;
 		// bytes of piece data received by the client from other peers due to
 		// this peer recommendation as the intermediary
-		boost::int64_t download_recommended;
+		std::int64_t download_recommended;
 		// bytes of piece data sent by any peer to this peer due to the client's referrals
-		boost::int64_t upload_referred;
+		std::int64_t upload_referred;
 		// bytes of piece data sent by this peer to each of the client's referrals
-		boost::int64_t download_referred;
+		std::int64_t download_referred;
 	};
 
 	struct signed_state : reputation_state
@@ -305,13 +303,13 @@ namespace
 
 		signed_state(bdecode_node const& e
 			, reputation_id const& expected_subject
-			, pubkey_type const& pk
+			, dht::public_key const& pk
 			, bool extra_fields_allowed = false)
 		{
 			if (e.type() != bdecode_node::dict_t)
 				throw reputation_exception("entry is not a dict");
 
-			if (e.data_section().second > 200)
+			if (e.data_section().size() > 200)
 				throw reputation_exception("entry is too big");
 
 			entry state_entry;
@@ -321,7 +319,7 @@ namespace
 
 		signed_state(entry const& e
 			, reputation_id const& expected_subject
-			, pubkey_type const& pk
+			, dht::public_key const& pk
 			, bool extra_fields_allowed = false)
 		{
 			if (e.type() != entry::dictionary_t)
@@ -336,26 +334,26 @@ namespace
 		{
 			entry e = reputation_state::to_entry();
 			e.dict().erase("subject");
-			e["sig"] = std::string(sig.data(), sig.size());
+			e["sig"] = sig.bytes;
 			return e;
 		}
 
 		void clear_signature()
 		{
-			std::fill(sig.begin(), sig.end(), 0);
+			sig.bytes.fill(0);
 		}
 
 		bool signature_valid()
 		{
-			return signature_type::size_type(std::count(sig.begin(), sig.end(), 0)) != sig.size();
+			return !std::all_of(sig.bytes.begin(), sig.bytes.end(), [](char c) { return c == 0; });
 		}
 
-		signature_type sig;
+		dht::signature sig;
 
 	private:
 		void from_entry(entry& state_entry
 			, reputation_id const& expected_subject
-			, pubkey_type const& pk
+			, dht::public_key const& pk
 			, bool extra_fields_allowed)
 		{
 			entry::dictionary_type& dict = state_entry.dict();
@@ -370,18 +368,15 @@ namespace
 			if (sig_entry == dict.end() || sig_entry->second.type() != entry::string_t)
 				throw reputation_exception("invalid signature");
 			entry::string_type const& sig_string = sig_entry->second.string();
-			if (sig_string.size() != sig.size())
+			if (sig_string.size() != sig.len)
 				throw reputation_exception("invalid signature");
-			std::copy(sig_string.begin(), sig_string.end(), sig.begin());
+			std::copy(sig_string.begin(), sig_string.end(), sig.bytes.begin());
 
 			dict.erase("sig");
-			boost::array<char, 256> verify_str;
-			int bsize = bencode(verify_str.begin(), state_entry);
+			std::array<char, 256> verify_str;
+			std::size_t bsize = bencode(verify_str.begin(), state_entry);
 			TORRENT_ASSERT(bsize < 256);
-			if (ed25519_verify((unsigned char*)sig.data()
-				, (unsigned char*)verify_str.data()
-				, bsize
-				, (unsigned char*)pk.data()) != 1)
+			if (!dht::ed25519_verify(sig, { verify_str.data(), bsize }, pk))
 			{
 				throw reputation_exception("invalid signature");
 			}
@@ -395,7 +390,7 @@ namespace
 				assign_entry(upload_referred, dict, "rs");
 				assign_entry(download_referred, dict, "rr");
 			}
-			catch (libtorrent_exception)
+			catch (system_error)
 			{
 				throw reputation_exception("invalid state counter");
 			}
@@ -412,7 +407,7 @@ namespace
 			}
 		}
 
-		void assign_entry(boost::int64_t& dest, entry::dictionary_type const& e, char const* name)
+		void assign_entry(std::int64_t& dest, entry::dictionary_type const& e, char const* name)
 		{
 			entry::dictionary_type::const_iterator elm = e.find(name);
 			if (elm == e.end())
@@ -429,9 +424,9 @@ namespace
 			: sequence(-1), intermediary(invalid_reputation_key), contribution(0) {}
 		attribution(reputation_key i, int c)
 			: sequence(-1), intermediary(i), contribution(c) {}
-		boost::int64_t sequence;
+		std::int64_t sequence;
 		reputation_key intermediary;
-		boost::uint8_t contribution;
+		std::uint8_t contribution;
 		bool credited;
 	};
 
@@ -477,7 +472,7 @@ namespace
 		standing_update(entry& e
 			, reputation_id const& expected_sender
 			, reputation_id const& expected_recipient
-			, pubkey_type recipient_pk)
+			, dht::public_key recipient_pk)
 			: recipient(expected_recipient)
 		{
 			if (e.type() != entry::dictionary_t)
@@ -509,35 +504,32 @@ namespace
 			entry::dictionary_type::iterator sig_entry = edict.find("sig");
 			if (sig_entry == edict.end()
 				|| sig_entry->second.type() != entry::string_t
-				|| sig_entry->second.string().length() != signature_type::static_size)
+				|| sig_entry->second.string().length() != sig.len)
 				throw reputation_exception("invalid signature");
 			std::copy(sig_entry->second.string().begin()
 				, sig_entry->second.string().end()
-				, sig.begin());
+				, sig.bytes.begin());
 
 			edict["sender"] = expected_sender.to_string();
 			edict["recipient"] = expected_recipient.to_string();
 			edict.erase("sig");
 
-			boost::array<char, 256> verify_str;
-			int bsize = bencode(verify_str.begin(), e);
+			std::array<char, 256> verify_str;
+			std::size_t bsize = bencode(verify_str.begin(), e);
 			TORRENT_ASSERT(bsize < 256);
-			edict["sig"] = std::string(sig.data(), sig.size());
-			if (ed25519_verify((unsigned char*)sig.data()
-				, (unsigned char*)verify_str.data()
-				, bsize
-				, (unsigned char*)recipient_pk.data()) != 1)
+			edict["sig"] = sig.bytes;
+			if (!dht::ed25519_verify(sig, { verify_str.data(), bsize }, recipient_pk))
 			{
 				throw reputation_exception("invalid signature");
 			}
 		}
 
 		standing_update(
-			boost::int64_t sequence
+			std::int64_t sequence
 			, reputation_id recipient
 			, reputation_id intermediary
-			, boost::int64_t volume
-			, signature_type sig)
+			, std::int64_t volume
+			, dht::signature sig)
 				: sequence(sequence)
 				, recipient(recipient)
 				, intermediary(intermediary)
@@ -554,17 +546,17 @@ namespace
 			e["sender"] = sender.to_string();
 			e["recipient"] = recipient.to_string();
 			e["volume"] = volume;
-			e["sig"] = std::string(sig.data(), sig.size());
+			e["sig"] = sig.bytes;
 			return e;
 		}
 
-		boost::int64_t sequence;
+		std::int64_t sequence;
 		// currently this struct is only used for forwarding updates so the sender is always the client
 		//reputation_id sender;
 		reputation_id recipient;
 		reputation_id intermediary;
-		boost::int64_t volume;
-		signature_type sig;
+		std::int64_t volume;
+		dht::signature sig;
 	};
 
 	struct stored_standing_update
@@ -591,14 +583,14 @@ namespace
 	class reputation_session;
 	class reputation_peer_plugin;
 
-	struct reputation_torrent_plugin : torrent_plugin
+	struct reputation_torrent_plugin final : torrent_plugin
 	{
 		reputation_torrent_plugin(reputation_manager& repman)
 			: m_repman(repman)
 		{}
 
-		virtual boost::shared_ptr<peer_plugin> new_connection(
-			peer_connection_handle const& pc);
+		std::shared_ptr<peer_plugin> new_connection(
+			peer_connection_handle const& pc) override;
 
 	private:
 		reputation_manager& m_repman;
@@ -614,7 +606,7 @@ namespace
 				+ sizeof(boost::asio::ip::address_v6::bytes_type) + sizeof(uint16_t),
 		};
 
-		typedef boost::array<boost::uint8_t, v46_size> bytes_type;
+		typedef std::array<std::uint8_t, v46_size> bytes_type;
 
 		template <typename OutIterator>
 		OutIterator to_bytes(OutIterator out) const
@@ -677,32 +669,32 @@ namespace
 	};
 
 	void pbkdf2_hmac_sha256(std::string const& pw
-		, std::vector<boost::uint8_t> const& salt
-		, boost::array<boost::uint8_t, 32>& key)
+		, span<char const> salt
+		, std::array<std::uint8_t, 32>& key)
 	{
-		boost::array<boost::uint8_t, 4> const i = {0,0,0,1};
-		boost::array<boost::uint8_t, 64> mac_key = {0};
+		std::array<std::uint8_t, 4> const i = {0,0,0,1};
+		std::array<std::uint8_t, 64> mac_key = {0};
 
 		if (pw.size() > mac_key.size())
 		{
 			CSha256 pw_digest;
 			Sha256_Init(&pw_digest);
-			Sha256_Update(&pw_digest, (boost::uint8_t*)pw.data(), pw.size());
+			Sha256_Update(&pw_digest, (std::uint8_t*)pw.data(), pw.size());
 			Sha256_Final(&pw_digest, mac_key.data());
 		}
 		else
 			std::copy(pw.begin(), pw.end(), mac_key.begin());
 
-		boost::array<boost::uint8_t, 64> ikey, okey;
+		std::array<std::uint8_t, 64> ikey, okey;
 		std::transform(mac_key.begin(), mac_key.end(), ikey.begin()
-			, boost::bind(std::bit_xor<boost::uint8_t>(), 0x36, _1));
+			, std::bind(std::bit_xor<std::uint8_t>(), 0x36, _1));
 		std::transform(mac_key.begin(), mac_key.end(), okey.begin()
-			, boost::bind(std::bit_xor<boost::uint8_t>(), 0x5c, _1));
+			, std::bind(std::bit_xor<std::uint8_t>(), 0x5c, _1));
 
 		CSha256 digest;
 		Sha256_Init(&digest);
 		Sha256_Update(&digest, ikey.data(), ikey.size());
-		Sha256_Update(&digest, salt.data(), salt.size());
+		Sha256_Update(&digest, (uint8_t const*)salt.data(), salt.size());
 		Sha256_Update(&digest, i.data(), i.size());
 		Sha256_Final(&digest, key.data());
 
@@ -711,7 +703,7 @@ namespace
 		Sha256_Update(&digest, key.data(), key.size());
 		Sha256_Final(&digest, key.data());
 
-		boost::array<boost::uint8_t, 32> u = key;
+		std::array<std::uint8_t, 32> u = key;
 
 		for (int round = 1; round < 16384; ++round)
 		{
@@ -726,25 +718,25 @@ namespace
 			Sha256_Final(&digest, u.data());
 
 			std::transform(key.begin(), key.end(), u.begin(), key.begin()
-				, std::bit_xor<boost::uint8_t>());
+				, std::bit_xor<std::uint8_t>());
 		}
 	}
 
 	void encrypt_seed(std::string const& sk_password
-		, pubkey_type const& client_pk
-		, boost::array<unsigned char, ed25519_seed_size>& seed)
+		, dht::public_key const& client_pk
+		, std::array<char, 32>& seed)
 	{
-		boost::array<boost::uint8_t, 32> private_enc_key;
+		std::array<std::uint8_t, 32> private_enc_key;
 		pbkdf2_hmac_sha256(sk_password
-			, std::vector<uint8_t>(client_pk.begin(), client_pk.end())
+			, client_pk.bytes
 			, private_enc_key);
 
 		chacha_ctx seed_encrypt;
 		chacha_keysetup(&seed_encrypt, private_enc_key.data(), 256);
 		unsigned char iv[CHACHA_NONCELEN] = {0,0,0,0,0,0,0,0};
 		chacha_ivsetup(&seed_encrypt, iv, 0);
-		std::vector<boost::asio::mutable_buffer> m;
-		m.push_back(boost::asio::mutable_buffer(seed.data(), seed.size()));
+		span<char> seed_span{ seed };
+		span<span<char>> m{ seed_span };
 		chacha_encrypt_bytes(&seed_encrypt, m);
 	}
 
@@ -752,8 +744,8 @@ namespace
 	{
 		db_init_error() : m_what("error initializing reputation database") {}
 		db_init_error(std::string const& w) : m_what(w) {}
-		virtual char const* what() const throw() { return m_what.c_str(); }
-		virtual ~db_init_error() throw() {}
+		char const* what() const noexcept override { return m_what.c_str(); }
+		~db_init_error() noexcept override {}
 		std::string m_what;
 	};
 
@@ -869,17 +861,17 @@ namespace
 			sqlite3* m_db;
 		};
 
-		bool establish_client(pubkey_type const& client_pk)
+		bool establish_client(dht::public_key const& client_pk)
 		{
-			pubkey_type db_client_pk;
+			dht::public_key db_client_pk;
 			if (get_pkey(client_reputation_key, db_client_pk))
 			{
-				if (db_client_pk != client_pk)
+				if (!(db_client_pk == client_pk))
 					return false;
 			}
 			else
 			{
-				reputation_id client_rid = hasher(client_pk.data(), client_pk.size()).final();
+				reputation_id client_rid = hasher(client_pk.bytes).final();
 				sqlite3_stmt* establish_client;
 				int result = sqlite3_prepare_v2(m_db
 					, "INSERT OR IGNORE INTO peers (reputation_key, public_key, reputation_id) \
@@ -887,8 +879,8 @@ namespace
 					, -1, &establish_client, NULL);
 				TORRENT_ASSERT(result == SQLITE_OK);
 				sqlite3_bind_int64(establish_client, 1, client_reputation_key);
-				sqlite3_bind_blob(establish_client, 2, client_pk.data(), client_pk.size(), SQLITE_STATIC);
-				sqlite3_bind_blob(establish_client, 3, &client_rid[0], reputation_id::size, SQLITE_STATIC);
+				sqlite3_bind_blob(establish_client, 2, client_pk.bytes.data(), client_pk.bytes.size(), SQLITE_STATIC);
+				sqlite3_bind_blob(establish_client, 3, &client_rid[0], reputation_id::size(), SQLITE_STATIC);
 				result = sqlite3_step(establish_client);
 				TORRENT_ASSERT(result == SQLITE_DONE);
 				sqlite3_reset(establish_client);
@@ -897,15 +889,15 @@ namespace
 			return true;
 		}
 
-		reputation_key establish_peer(pubkey_type const& pk
+		reputation_key establish_peer(dht::public_key const& pk
 			, reputation_id const& rid
 			, contact_info const& ci)
 		{
 			reputation_key rkey = get_rkey(rid);
 			if (!valid(rkey))
 			{
-				sqlite3_bind_blob(m_establish_peer, 1, pk.data(), pk.size(), SQLITE_STATIC);
-				sqlite3_bind_blob(m_establish_peer, 2, &rid[0], reputation_id::size, SQLITE_STATIC);
+				sqlite3_bind_blob(m_establish_peer, 1, pk.bytes.data(), pk.bytes.size(), SQLITE_STATIC);
+				sqlite3_bind_blob(m_establish_peer, 2, &rid[0], reputation_id::size(), SQLITE_STATIC);
 				sqlite_bind_ci(m_establish_peer, 3, ci);
 				int result = sqlite3_step(m_establish_peer);
 				TORRENT_ASSERT(result == SQLITE_DONE);
@@ -926,8 +918,8 @@ namespace
 			if (result == SQLITE_ROW)
 			{
 				int rid_size = sqlite3_column_bytes(m_get_rid, 0);
-				TORRENT_ASSERT(rid_size == reputation_id::size);
-				if (rid_size == reputation_id::size)
+				TORRENT_ASSERT(rid_size == reputation_id::size());
+				if (rid_size == reputation_id::size())
 				{
 					rid.assign((char*)sqlite3_column_blob(m_get_rid, 0));
 					ret = true;
@@ -942,7 +934,7 @@ namespace
 		reputation_key get_rkey(reputation_id const& rid)
 		{
 			reputation_key rkey = invalid_reputation_key;
-			sqlite3_bind_blob(m_get_key, 1, &rid[0], reputation_id::size, SQLITE_STATIC);
+			sqlite3_bind_blob(m_get_key, 1, &rid[0], reputation_id::size(), SQLITE_STATIC);
 			int result = sqlite3_step(m_get_key);
 			if (result == SQLITE_ROW)
 			{
@@ -954,16 +946,16 @@ namespace
 			return rkey;
 		}
 
-		bool get_pkey(reputation_key rkey, pubkey_type& pk)
+		bool get_pkey(reputation_key rkey, dht::public_key& pk)
 		{
 			bool ret = false;
 			sqlite3_bind_int64(m_get_pkey, 1, rkey);
 			int result = sqlite3_step(m_get_pkey);
 			if (result == SQLITE_ROW)
 			{
-				if (sqlite3_column_bytes(m_get_pkey, 0) == int(pk.size()))
+				if (sqlite3_column_bytes(m_get_pkey, 0) == int(pk.bytes.size()))
 				{
-					memcpy(pk.data(), sqlite3_column_blob(m_get_pkey, 0), pk.size());
+					memcpy(pk.bytes.data(), sqlite3_column_blob(m_get_pkey, 0), pk.bytes.size());
 					ret = true;
 				}
 			}
@@ -978,8 +970,8 @@ namespace
 			while ((result = sqlite3_step(m_known_peers)) == SQLITE_ROW )
 			{
 				int rid_size = sqlite3_column_bytes(m_known_peers, 0);
-				TORRENT_ASSERT(rid_size == reputation_id::size);
-				if (rid_size == reputation_id::size)
+				TORRENT_ASSERT(rid_size == reputation_id::size());
+				if (rid_size == reputation_id::size())
 				{
 					peers.push_back(reputation_id((char const*)sqlite3_column_blob(m_known_peers, 0)));
 				}
@@ -1019,7 +1011,7 @@ namespace
 			double count = 0;
 			reputation_key rep_key = -1;
 
-			sqlite3_bind_blob(m_observation_count, 1, peer.begin(), peer.size, SQLITE_STATIC);
+			sqlite3_bind_blob(m_observation_count, 1, peer.begin(), peer.size(), SQLITE_STATIC);
 			int result = sqlite3_step(m_observation_count);
 			if (result == SQLITE_ROW)
 			{
@@ -1052,8 +1044,8 @@ namespace
 			bool greater = false;
 			bool less = false;
 
-			boost::int64_t upload_referred_increase = 0;
-			boost::int64_t download_referred_increase = 0;
+			std::int64_t upload_referred_increase = 0;
+			std::int64_t download_referred_increase = 0;
 
 			sqlite3_bind_int64(m_state_at_for, 1, at);
 			sqlite3_bind_int64(m_state_at_for, 2, for_);
@@ -1097,7 +1089,7 @@ namespace
 				sqlite3_bind_int64(m_store_state, 2, for_);
 				sqlite_bind_state(m_store_state, 3, state);
 				if (state.signature_valid())
-					sqlite3_bind_blob(m_store_state, 9, state.sig.data(), state.sig.size(), SQLITE_STATIC);
+					sqlite3_bind_blob(m_store_state, 9, state.sig.bytes.data(), state.sig.bytes.size(), SQLITE_STATIC);
 				else
 					sqlite3_bind_null(m_store_state, 9);
 				result = sqlite3_step(m_store_state);
@@ -1218,12 +1210,12 @@ namespace
 
 		void on_receipt(reputation_key recipient
 			, reputation_key sender
-			, boost::int64_t sequence
-			, boost::int64_t volume)
+			, std::int64_t sequence
+			, std::int64_t volume)
 		{
 			transaction t(*this);
 
-			boost::int64_t last_sequence = -1;
+			std::int64_t last_sequence = -1;
 
 			sqlite3_bind_int64(m_last_sequence, 1, recipient);
 			sqlite3_bind_int64(m_last_sequence, 2, sender);
@@ -1249,7 +1241,7 @@ namespace
 			if (!state_at_for(client_reputation_key, recipient, recipient_state))
 				return;
 
-			boost::int64_t const max_upload_referred
+			std::int64_t const max_upload_referred
 				= recipient_state.download_referred
 				+ recipient_state.download_direct
 				- recipient_state.upload_direct;
@@ -1257,7 +1249,7 @@ namespace
 			// cap volume to enforce no negative ballance
 			if (recipient_state.upload_referred + volume > max_upload_referred)
 				volume = std::max(max_upload_referred - recipient_state.upload_referred
-					, boost::int64_t(0));
+					, std::int64_t(0));
 
 			if (volume > 0)
 			{
@@ -1294,9 +1286,9 @@ namespace
 			sqlite3_reset(m_touch_peer_state);
 		}
 
-		boost::int64_t global_direct_transfer_balance()
+		std::int64_t global_direct_transfer_balance()
 		{
-			boost::int64_t balance = 0;
+			std::int64_t balance = 0;
 			int result = sqlite3_step(m_global_direct_balance);
 			TORRENT_ASSERT(result == SQLITE_ROW);
 			if (result == SQLITE_ROW)
@@ -1331,7 +1323,7 @@ namespace
 			return default_;
 		}
 
-		sqlite_int64 get_int64_value(int key, sqlite_int64 default_)
+		std::int64_t get_int64_value(int key, sqlite_int64 default_)
 		{
 			sqlite3_bind_int(m_get_value, 1, key);
 			int result = sqlite3_step(m_get_value);
@@ -1407,7 +1399,7 @@ namespace
 
 		void save_pending_update(stored_standing_update const& update)
 		{
-			boost::int64_t volume = 0;
+			std::int64_t volume = 0;
 			int retries = 0;
 			time_t last_attempt = time(NULL);
 
@@ -1450,7 +1442,7 @@ namespace
 				sqlite3_bind_int64(m_save_update, 2, update.recipient);
 				sqlite3_bind_int64(m_save_update, 3, update.update.sequence);
 				sqlite3_bind_int64(m_save_update, 4, update.update.volume);
-				sqlite3_bind_blob(m_save_update, 5, update.update.sig.data(), update.update.sig.size(), SQLITE_STATIC);
+				sqlite3_bind_blob(m_save_update, 5, update.update.sig.bytes.data(), update.update.sig.bytes.size(), SQLITE_STATIC);
 				sqlite3_bind_int64(m_save_update, 6, last_attempt);
 				sqlite3_bind_int(m_save_update, 7, retries);
 				result = sqlite3_step(m_save_update);
@@ -1460,7 +1452,7 @@ namespace
 		}
 
 		void delete_pending_update(reputation_key intermediary, reputation_key recipient
-			, boost::int64_t sequence, boost::int64_t volume)
+			, std::int64_t sequence, std::int64_t volume)
 		{
 			sqlite3_bind_int64(m_delete_update, 1, intermediary);
 			sqlite3_bind_int64(m_delete_update, 2, recipient);
@@ -1502,9 +1494,9 @@ namespace
 				if (sig != NULL)
 				{
 					unsigned sig_size = unsigned(sqlite3_column_bytes(m_state_at_for, 6));
-					TORRENT_ASSERT(sig_size == state.sig.size());
-					if (sig_size == state.sig.size())
-						memcpy(state.sig.data(), sig, state.sig.size());
+					TORRENT_ASSERT(sig_size == state.sig.bytes.size());
+					if (sig_size == state.sig.bytes.size())
+						memcpy(state.sig.bytes.data(), sig, state.sig.bytes.size());
 					else
 						return false;
 				}
@@ -1553,13 +1545,13 @@ namespace
 		stored_standing_update load_standing_update(sqlite3_stmt* query)
 		{
 			reputation_id recipient,intermediary;
-			signature_type sig;
+			dht::signature sig;
 			get_rid(sqlite3_column_int64(query, update_intermediary), intermediary);
 			get_rid(sqlite3_column_int64(query, update_recipient), recipient);
-			TORRENT_ASSERT(sqlite3_column_bytes(query, update_sig) == int(sig.size()));
-			if (sqlite3_column_bytes(query, update_sig) != int(sig.size()))
+			TORRENT_ASSERT(sqlite3_column_bytes(query, update_sig) == int(sig.bytes.size()));
+			if (sqlite3_column_bytes(query, update_sig) != int(sig.bytes.size()))
 				throw reputation_exception("wrong size for signature");
-			std::memcpy(sig.data(), sqlite3_column_blob(query, update_sig), sig.size());
+			std::memcpy(sig.bytes.data(), sqlite3_column_blob(query, update_sig), sig.bytes.size());
 			return stored_standing_update(standing_update(
 					sqlite3_column_int64(query, update_sequence)
 					, recipient
@@ -1814,7 +1806,7 @@ namespace
 	char const*const reputation_store::retryable_updates_stmt =
 		"SELECT * FROM outgoing_updates WHERE strftime('%s','now') - last_attempt > retries * retries * 60*60 + 60*60";
 
-	class reputation_manager : public plugin
+	class reputation_manager final : public plugin
 	{
 		struct attribution_candidate : reputation_value
 		{
@@ -1822,7 +1814,7 @@ namespace
 				: reputation_value(v, a.intermediary)
 				, sequence(a.sequence)
 			{}
-			boost::int64_t sequence;
+			std::int64_t sequence;
 		};
 
 		enum store_values
@@ -1844,29 +1836,28 @@ namespace
 			, m_global_balance(m_store.global_direct_transfer_balance())
 			, m_identity(identity)
 		{
-			pubkey_type db_client_pk;
+			dht::public_key db_client_pk;
 			if (pkey(client_reputation_key, db_client_pk))
 			{
-				if (db_client_pk != identity.key.pk)
+				if (!(db_client_pk == identity.key.pk))
 				{
 					std::vector<char> chipher_seed = m_store.get_blob_value(store_private_seed);
-					if (chipher_seed.size() != ed25519_seed_size)
+					if (chipher_seed.size() != 32)
 						throw reputation_exception("supplied key does not match database");
 
-					boost::array<unsigned char, ed25519_seed_size> seed;
+					std::array<char, 32> seed;
 					std::copy(chipher_seed.begin(), chipher_seed.end(), seed.begin());
 
 					encrypt_seed(sk_password, db_client_pk, seed);
 					identity.create_keypair(seed);
 
-					if (db_client_pk != identity.key.pk)
+					if (!(db_client_pk == identity.key.pk))
 						throw bad_reputation_password();
 				}
 			}
 			else
 			{
-				boost::array<unsigned char, ed25519_seed_size> seed;
-				ed25519_create_seed(seed.data());
+				auto seed = dht::ed25519_create_seed();
 				identity.create_keypair(seed);
 
 				encrypt_seed(sk_password, identity.key.pk, seed);
@@ -1878,28 +1869,38 @@ namespace
 				m_store.establish_client(identity.key.pk);
 			}
 
-			m_client_rid = hasher(identity.key.pk.data(), identity.key.pk.size()).final();
+			m_client_rid = hasher(identity.key.pk.bytes).final();
 		}
 
-		virtual boost::shared_ptr<torrent_plugin> new_torrent(torrent_handle const&, void*)
+		// this is a workaround for a bug in gcc 6.3.0 where it does not emit a vtable
+		// for a class unless at least one of its virtual member functions is non-inline
+		~reputation_manager();
+
+		std::uint32_t implemented_features() override
+		{ return optimistic_unchoke_feature | tick_feature | dht_request_feature | alert_feature; }
+
+		std::shared_ptr<torrent_plugin> new_torrent(torrent_handle const&, void*) override
 		{
-			return boost::make_shared<reputation_torrent_plugin>(boost::ref(*this));
+			return std::make_shared<reputation_torrent_plugin>(std::ref(*this));
 		}
 
-		virtual void added(session_handle ses)
+		void added(session_handle const& ses) override
 		{
 			m_ses = ses;
 		}
 
-		virtual void register_dht_extensions(dht_extensions_t& exts)
+		bool on_dht_request(string_view query
+			, udp::endpoint const& source, bdecode_node const& message
+			, entry& response) override
 		{
-			exts.push_back(std::make_pair("update_standing"
-				, boost::bind(&reputation_manager::on_update_standing, this, _1, _2, _3)));
-			exts.push_back(std::make_pair("get_standing"
-				, boost::bind(&reputation_manager::on_get_standing, this, _1, _2, _3)));
+			if (query == "update_standing")
+				return on_update_standing(source, message, response);
+			else if (query == "get_standing")
+				return on_get_standing(source, message, response);
+			return false;
 		}
 
-		virtual void on_alert(alert const* a)
+		void on_alert(alert const* a) override
 		{
 			if (a->type() == dht_mutable_item_alert::alert_type)
 				incoming_mutable_item(*static_cast<dht_mutable_item_alert const*>(a));
@@ -1917,7 +1918,7 @@ namespace
 				dht_direct_response_alert const* r = static_cast<dht_direct_response_alert const*>(a);
 
 				{
-					forward_standing_request_ctx* c = reinterpret_cast<forward_standing_request_ctx*>(r->userdata);
+					forward_standing_request_ctx const* c = reinterpret_cast<forward_standing_request_ctx const*>(r->userdata);
 					std::vector<forward_standing_request_ctx*>::iterator new_end
 						= std::remove(m_outstanding_forward_queries.begin(), m_outstanding_forward_queries.end(), c);
 					if (new_end != m_outstanding_forward_queries.end())
@@ -1930,7 +1931,7 @@ namespace
 				}
 
 				{
-					get_standing_request_ctx* c = reinterpret_cast<get_standing_request_ctx*>(r->userdata);
+					get_standing_request_ctx const* c = reinterpret_cast<get_standing_request_ctx const*>(r->userdata);
 					std::vector<get_standing_request_ctx*>::iterator new_end
 						= std::remove(m_outstanding_get_queries.begin(), m_outstanding_get_queries.end(), c);
 					if (new_end != m_outstanding_get_queries.end())
@@ -1944,7 +1945,7 @@ namespace
 			}
 		}
 
-		virtual void on_tick()
+		void on_tick() override
 		{
 			time_point now = clock_type::now();
 
@@ -1981,14 +1982,14 @@ namespace
 					signed_state state;
 					state.subject = u->update.intermediary;
 					m_store.state_at_for(client_reputation_key, u->intermediary, state);
-					forward_standing(*u, state, boost::weak_ptr<reputation_session>());
+					forward_standing(*u, state, std::weak_ptr<reputation_session>());
 				}
 			}
 
 			send_next_standing();
 		}
 
-		virtual bool on_optimistic_unchoke(std::vector<peer_connection_handle>& peers);
+		std::uint64_t get_unchoke_priority(peer_connection_handle const& peer) override;
 
 		bool on_get_standing(udp::endpoint const&
 			, bdecode_node const& request, entry& response)
@@ -2010,13 +2011,13 @@ namespace
 			char error_string[200];
 
 			key_desc_t msg_desc[] = {
-				{"for", bdecode_node::string_t, reputation_id::size, 0},
-				{"sender", bdecode_node::string_t, reputation_id::size, 0},
+				{"for", bdecode_node::string_t, reputation_id::size(), 0},
+				{"sender", bdecode_node::string_t, reputation_id::size(), 0},
 				{"state", bdecode_node::dict_t, 0, 0},
 			};
 
 			bdecode_node msg_keys[3];
-			if (!verify_message(arg_ent, msg_desc, msg_keys, error_string, sizeof(error_string)))
+			if (!verify_message(arg_ent, msg_desc, msg_keys, error_string))
 			{
 				incoming_error(response, error_string);
 				return true;
@@ -2040,7 +2041,7 @@ namespace
 				return true;
 			}
 
-			pubkey_type requester_pk;
+			dht::public_key requester_pk;
 			if (pkey(requester, requester_pk))
 			{
 				try
@@ -2103,19 +2104,19 @@ namespace
 				key_state,
 			};
 			key_desc_t msg_desc[] = {
-				{"id", bdecode_node::string_t, reputation_id::size, 0},
+				{"id", bdecode_node::string_t, reputation_id::size(), 0},
 				{"receipt", bdecode_node::dict_t, 0, key_desc_t::parse_children},
 					{"seq", bdecode_node::int_t, 0, 0},
-					{"sender", bdecode_node::string_t, reputation_id::size, 0},
-					{"recipient", bdecode_node::string_t, reputation_id::size, 0},
-					{"intermediary", bdecode_node::string_t, reputation_id::size, key_desc_t::optional},
+					{"sender", bdecode_node::string_t, reputation_id::size(), 0},
+					{"recipient", bdecode_node::string_t, reputation_id::size(), 0},
+					{"intermediary", bdecode_node::string_t, reputation_id::size(), key_desc_t::optional},
 					{"volume", bdecode_node::int_t, 0, 0},
-					{"sig", bdecode_node::string_t, signature_type::static_size, key_desc_t::last_child},
+					{"sig", bdecode_node::string_t, dht::signature().len, key_desc_t::last_child},
 				{"state", bdecode_node::dict_t, 0, 0},
 			};
 
 			bdecode_node msg_keys[9];
-			if (!verify_message(arg_ent, msg_desc, msg_keys, error_string, sizeof(error_string)))
+			if (!verify_message(arg_ent, msg_desc, msg_keys, error_string))
 			{
 				incoming_error(response, error_string);
 				return true;
@@ -2157,7 +2158,7 @@ namespace
 				return true;
 			}
 
-			pubkey_type recipient_pk;
+			dht::public_key recipient_pk;
 			if (!pkey(recipient, recipient_pk))
 			{
 				TORRENT_ASSERT(false);
@@ -2165,7 +2166,7 @@ namespace
 				return true;
 			}
 
-			if (arg_ent.data_section().second > 1000)
+			if (arg_ent.data_section().size() > 1000)
 			{
 				incoming_error(response, "standing update too big");
 				return true;
@@ -2176,20 +2177,19 @@ namespace
 				validation_entry = msg_keys[key_receipt];
 				validation_entry.dict().erase("sig");
 				validation_entry["intermediary"] = m_client_rid.to_string();
-				boost::array<char, 1024> validation_buf;
-				int bsize = bencode(validation_buf.begin(), validation_entry);
+				std::array<char, 1024> validation_buf;
+				std::size_t bsize = bencode(validation_buf.begin(), validation_entry);
 				TORRENT_ASSERT(bsize < 1024);
-				if (ed25519_verify((unsigned char*)msg_keys[key_sig].string_ptr()
-					, (unsigned char*)validation_buf.data()
-					, bsize
-					, (unsigned char const*)recipient_pk.data()) != 1)
+				if (!dht::ed25519_verify(signature(msg_keys[key_sig].string_ptr())
+					, { validation_buf.data(), bsize }
+					, recipient_pk))
 				{
 					incoming_error(response, "invalid signature");
 					return true;
 				}
 			}
 
-			pubkey_type sender_pk;
+			dht::public_key sender_pk;
 			if (pkey(sender, sender_pk))
 			{
 				try
@@ -2235,13 +2235,9 @@ namespace
 			return m_client_rid;
 		}
 
-		void sign(char const* m, int mlen, char* sig)
+		void sign(span<char const> m, dht::signature& sig)
 		{
-			ed25519_sign((unsigned char*)sig
-				, (unsigned char const*)m
-				, mlen
-				, (unsigned char const*)m_identity.key.pk.data()
-				, (unsigned char const*)m_identity.key.sk.data());
+			sig = dht::ed25519_sign(m, m_identity.key.pk, m_identity.key.sk);
 		}
 
 		friend class transaction;
@@ -2253,7 +2249,7 @@ namespace
 			{}
 		};
 
-		reputation_key establish_peer(pubkey_type const& pk
+		reputation_key establish_peer(dht::public_key const& pk
 			, reputation_id const& rid
 			, contact_info const& ci)
 		{
@@ -2278,7 +2274,7 @@ namespace
 			return m_store.get_rkey(rid);
 		}
 
-		bool pkey(reputation_key rkey, pubkey_type& pk)
+		bool pkey(reputation_key rkey, dht::public_key& pk)
 		{
 			return m_store.get_pkey(rkey, pk);
 		}
@@ -2343,7 +2339,7 @@ namespace
 
 				rep.attributions.push_back(attribution(
 					i->rkey
-					, boost::uint8_t(contribution)));
+					, std::uint8_t(contribution)));
 
 				rounding_error -= contribution;
 				touch(i->rkey);
@@ -2366,10 +2362,10 @@ namespace
 
 			if (at == client_reputation_key)
 			{
-				boost::array<char, 256> state_buf;
-				int bsize = bencode(state_buf.begin(), state.reputation_state::to_entry());
+				std::array<char, 256> state_buf;
+				std::size_t bsize = bencode(state_buf.begin(), state.reputation_state::to_entry());
 				TORRENT_ASSERT(bsize < 256);
-				sign(state_buf.data(), bsize, state.sig.data());
+				sign({ state_buf.data(), bsize }, state.sig);
 			}
 			return true;
 		}
@@ -2384,25 +2380,25 @@ namespace
 		{
 			m_global_balance += state.upload_direct - state.download_direct;
 			m_store.update_state_for(peer, state);
-			boost::array<char, 256> state_buf;
-			int bsize = bencode(state_buf.begin(), state.reputation_state::to_entry());
+			std::array<char, 256> state_buf;
+			std::size_t bsize = bencode(state_buf.begin(), state.reputation_state::to_entry());
 			TORRENT_ASSERT(bsize < 256);
-			sign(state_buf.data(), bsize, state.sig.data());
+			sign({ state_buf.data(), bsize }, state.sig);
 		}
 
 		// take known peers received from a peer and sort them by acending preference
 		// that they be used as an intermediary
-		void consider_known_peers(buffer::const_interval known_peers
+		void consider_known_peers(span<char const> known_peers
 			, std::vector<reputation_key>& sorted_peers)
 		{
 			std::vector<std::pair<double, reputation_key> > candidates;
-			candidates.reserve(known_peers.left() / reputation_id::size);
+			candidates.reserve(known_peers.size() / reputation_id::size());
 
 			transaction t(*this);
 
-			while (known_peers.left() >= reputation_id::size)
+			while (known_peers.size() >= reputation_id::size())
 			{
-				reputation_id known_rid(known_peers.begin);
+				reputation_id known_rid(known_peers);
 				std::pair<double, reputation_key> known_obs = m_store.observation_count(known_rid);
 				if (valid(known_obs.second))
 				{
@@ -2417,7 +2413,7 @@ namespace
 						touch(known_obs.second);
 					}
 				}
-				known_peers.begin += reputation_id::size;
+				known_peers = known_peers.subspan(reputation_id::size());
 			}
 
 			std::sort(candidates.begin(), candidates.end());
@@ -2426,7 +2422,7 @@ namespace
 
 			sorted_peers.resize(std::distance(candidates.begin(), unique_end));
 			std::transform(candidates.begin(), unique_end, sorted_peers.begin()
-				, boost::bind(&std::pair<double, reputation_key>::second, _1));
+				, std::bind(&std::pair<double, reputation_key>::second, _1));
 		}
 
 		double direct_value(reputation_key peer)
@@ -2436,7 +2432,7 @@ namespace
 
 		void forward_standing(stored_standing_update const& update
 			, signed_state const& intermediary_state
-			, boost::weak_ptr<reputation_session> session)
+			, std::weak_ptr<reputation_session> session)
 		{
 			// recipient SHOULD be valid unless the update was loaded from storage
 			if (!session.expired() && m_store.has_pending_updates(update.intermediary))
@@ -2450,7 +2446,7 @@ namespace
 
 			bool new_intermediary;
 			query_destinations::iterator intermediary_queue;
-			boost::tie(intermediary_queue, new_intermediary) = m_datagram_queries.insert(
+			std::tie(intermediary_queue, new_intermediary) = m_datagram_queries.insert(
 				std::make_pair(update.intermediary, datagram_query_destination(intermediary_state)));
 
 			if (intermediary_queue->second.ci_status == ci_failed)
@@ -2462,7 +2458,7 @@ namespace
 
 			bool new_recipient;
 			outstanding_updates::iterator recipient_queue;
-			boost::tie(recipient_queue, new_recipient) = intermediary_queue->second.updates.insert(
+			std::tie(recipient_queue, new_recipient) = intermediary_queue->second.updates.insert(
 				std::make_pair(update.recipient, update_standing_recipient(update.update, session)));
 			if (new_recipient)
 			{
@@ -2488,7 +2484,7 @@ namespace
 		}
 
 		void get_standing(reputation_key at, reputation_key for_
-			, boost::weak_ptr<reputation_session> session)
+			, std::weak_ptr<reputation_session> session)
 		{
 			signed_state at_state;
 			reputation_id at_rid;
@@ -2497,7 +2493,7 @@ namespace
 			state_at(client_reputation_key, at, at_state);
 			bool new_intermediary;
 			query_destinations::iterator intermediary_queue;
-			boost::tie(intermediary_queue, new_intermediary) = m_datagram_queries.insert(
+			std::tie(intermediary_queue, new_intermediary) = m_datagram_queries.insert(
 				std::make_pair(at, datagram_query_destination(at_state)));
 
 			if (intermediary_queue->second.ci_status == ci_failed)
@@ -2508,7 +2504,7 @@ namespace
 
 			bool new_recipient;
 			outstanding_gets::iterator recipient_queue;
-			boost::tie(recipient_queue, new_recipient) = intermediary_queue->second.gets.insert(
+			std::tie(recipient_queue, new_recipient) = intermediary_queue->second.gets.insert(
 				std::make_pair(for_, get_standing_subject(session)));
 			if (new_recipient)
 			{
@@ -2531,26 +2527,26 @@ namespace
 			m_store.observed(peer);
 		}
 
-		boost::int64_t next_receipt_sequence()
+		std::int64_t next_receipt_sequence()
 		{
-			boost::int64_t sequence = m_store.get_int64_value(store_next_receipt_sequence, 0);
+			std::int64_t sequence = m_store.get_int64_value(store_next_receipt_sequence, 0);
 			m_store.set_int64_value(store_next_receipt_sequence, sequence + 1);
 			return sequence;
 		}
 
-		boost::int64_t adjust_download_direct(boost::int64_t credit)
+		std::int64_t adjust_download_direct(std::int64_t credit)
 		{
 			if (m_global_balance <= 0 || credit <= 0)
 				return credit;
-			boost::int64_t global_bytes_remaining = bytes_pending_download() + credit;
+			std::int64_t global_bytes_remaining = bytes_pending_download() + credit;
 			TORRENT_ASSERT(global_bytes_remaining > 0);
 			double multiplier = double(m_global_balance) / double(global_bytes_remaining);
 			if (multiplier <= 1.0)
 				return credit;
-			return boost::int64_t(credit * multiplier);
+			return std::int64_t(credit * multiplier);
 		}
 
-		void schedule_next_standing(boost::weak_ptr<reputation_session> peer)
+		void schedule_next_standing(std::weak_ptr<reputation_session> peer)
 		{
 			standing_queue_type::iterator existing = std::find_if(
 				m_standing_queue.begin(), m_standing_queue.end()
@@ -2567,12 +2563,12 @@ namespace
 				c.choke_this_peer();
 		}
 
-		session_handle session() const { return m_ses; }
+		session_handle const& session() const { return m_ses; }
 
-		boost::shared_ptr<reputation_session> peer_session(reputation_id const& rid)
+		std::shared_ptr<reputation_session> peer_session(reputation_id const& rid)
 		{
-			boost::shared_ptr<reputation_session> ses;
-			std::map<reputation_id, boost::weak_ptr<reputation_session> >::iterator ses_itr
+			std::shared_ptr<reputation_session> ses;
+			std::map<reputation_id, std::weak_ptr<reputation_session> >::iterator ses_itr
 				= m_sessions.find(rid);
 
 			if (ses_itr != m_sessions.end())
@@ -2580,13 +2576,13 @@ namespace
 				ses = ses_itr->second.lock();
 				if (!ses)
 				{
-					ses = boost::make_shared<reputation_session>(boost::ref(*this), rid);
+					ses = std::make_shared<reputation_session>(std::ref(*this), rid);
 					ses_itr->second = ses;
 				}
 			}
 			else
 			{
-				ses = boost::make_shared<reputation_session>(boost::ref(*this), rid);
+				ses = std::make_shared<reputation_session>(std::ref(*this), rid);
 				m_sessions.insert(std::make_pair(rid, ses));
 			}
 
@@ -2597,7 +2593,7 @@ namespace
 		void remove_session(reputation_id const& rid)
 		{
 #if defined TORRENT_DEBUG
-			std::map<reputation_id, boost::weak_ptr<reputation_session> >::iterator i
+			std::map<reputation_id, std::weak_ptr<reputation_session> >::iterator i
 				= m_sessions.find(rid);
 			TORRENT_ASSERT(i != m_sessions.end());
 			TORRENT_ASSERT(!i->second.lock());
@@ -2605,22 +2601,22 @@ namespace
 			m_sessions.erase(rid);
 		}
 
-		void payload_received(boost::int64_t bytes)
+		void payload_received(std::int64_t bytes)
 		{
 			int current_hour = m_store.get_int_value(store_xfer_history_current_hour, 0);
-			boost::int64_t current_payload_received
+			std::int64_t current_payload_received
 				= m_store.get_int64_value(store_xfer_history_hour_0 + current_hour, 0);
 			m_store.set_int64_value(store_xfer_history_hour_0 + current_hour
 				, current_payload_received + bytes);
 		}
 
-		void observe_peers(boost::int64_t session_bytes_downloaded
+		void observe_peers(std::int64_t session_bytes_downloaded
 			, std::vector<reputation_key> const& known_peers)
 		{
 			if (session_bytes_downloaded == 0)
 				return;
 
-			boost::int64_t bytes_downloaded_today = 0;
+			std::int64_t bytes_downloaded_today = 0;
 			for (int hour = 0; hour < 23; ++hour)
 				bytes_downloaded_today += m_store.get_int64_value(store_xfer_history_hour_0 + hour, 0);
 
@@ -2648,22 +2644,22 @@ namespace
 		struct update_standing_recipient
 		{
 			update_standing_recipient(standing_update const& u
-				, boost::weak_ptr<reputation_session> s)
+				, std::weak_ptr<reputation_session> s)
 				: updates(1, u), session(s), pending_ci(false)
 			{}
 
 			std::deque<standing_update> updates;
-			boost::weak_ptr<reputation_session> session;
+			std::weak_ptr<reputation_session> session;
 			bool pending_ci;
 		};
 
 		struct get_standing_subject
 		{
-			get_standing_subject(boost::weak_ptr<reputation_session> s)
+			get_standing_subject(std::weak_ptr<reputation_session> s)
 				: session(s), pending_ci(false)
 			{}
 
-			boost::weak_ptr<reputation_session> session;
+			std::weak_ptr<reputation_session> session;
 			bool pending_ci;
 		};
 
@@ -2733,7 +2729,7 @@ namespace
 
 		// queue for sending "my_standing" BT messages at regular intervals
 		// not to be confused with the queue for "standing_update" DHT messages defined above
-		typedef std::deque<std::pair<time_point, boost::weak_ptr<reputation_session> > > standing_queue_type;
+		typedef std::deque<std::pair<time_point, std::weak_ptr<reputation_session> > > standing_queue_type;
 
 		struct forward_standing_request_ctx
 		{
@@ -2770,16 +2766,18 @@ namespace
 
 		struct pending_standing_cmp
 		{
-			pending_standing_cmp(boost::weak_ptr<reputation_session> p)
+			pending_standing_cmp(std::weak_ptr<reputation_session> p)
 				: peer(p)
 			{}
 
 			bool operator()(reputation_manager::standing_queue_type::value_type const& o)
 			{
-				return !(o.second < peer || peer < o.second);
+				// TODO: this is a bit of a hack to check equality of two weak_ptrs
+				// is there a way to avoid it?
+				return !(o.second.owner_before(peer) || peer.owner_before(o.second));
 			}
 
-			boost::weak_ptr<reputation_session> peer;
+			std::weak_ptr<reputation_session> peer;
 		};
 
 		void erase_recipient(query_destinations::iterator intermediary
@@ -2840,7 +2838,7 @@ namespace
 					*this, intermediary, recipient);
 				m_outstanding_forward_queries.push_back(ctx);
 				m_ses.dht_direct_request(ep, e, ctx);
-					//, boost::bind(&reputation_manager::standing_update_ack, this, intermediary, recipient, _1));
+					//, std::bind(&reputation_manager::standing_update_ack, this, intermediary, recipient, _1));
 			}
 			else if (i.ci.addr_v4 != address_v4())
 			{
@@ -2851,7 +2849,7 @@ namespace
 					*this, intermediary, recipient);
 				m_outstanding_forward_queries.push_back(ctx);
 				m_ses.dht_direct_request(ep, e, ctx);
-					//, boost::bind(&reputation_manager::standing_update_ack, this, intermediary, recipient, _1));
+					//, std::bind(&reputation_manager::standing_update_ack, this, intermediary, recipient, _1));
 			}
 			else
 				standing_update_failure(intermediary, recipient, udp::endpoint());
@@ -2883,7 +2881,7 @@ namespace
 					*this, intermediary, recipient);
 				m_outstanding_get_queries.push_back(ctx);
 				m_ses.dht_direct_request(ep, e, ctx);
-					//, boost::bind(&reputation_manager::get_standing_ack, this, intermediary, recipient, _1));
+					//, std::bind(&reputation_manager::get_standing_ack, this, intermediary, recipient, _1));
 			}
 			else if (i.ci.addr_v4 != address_v4())
 			{
@@ -2894,7 +2892,7 @@ namespace
 					*this, intermediary, recipient);
 				m_outstanding_get_queries.push_back(ctx);
 				m_ses.dht_direct_request(ep, e, ctx);
-					//, boost::bind(&reputation_manager::get_standing_ack, this, intermediary, recipient, _1));
+					//, std::bind(&reputation_manager::get_standing_ack, this, intermediary, recipient, _1));
 			}
 			else
 				get_standing_failure(intermediary, recipient, udp::endpoint());
@@ -2913,11 +2911,11 @@ namespace
 			// give up if its IP changed less than 4 hours ago
 			if (time(NULL) - last_update > 60*60*4)
 			{
-				pubkey_type peer_key;
+				dht::public_key peer_key;
 				if (pkey(intermediary->first, peer_key)
 					&& m_ses.is_valid() && m_ses.is_dht_running())
 				{
-					m_ses.dht_get_item(peer_key);
+					m_ses.dht_get_item(peer_key.bytes);
 					intermediary->second.ci_status = ci_pending;
 					return get_ci_sent;
 				}
@@ -3046,7 +3044,7 @@ namespace
 				for (std::vector<stored_standing_update>::iterator i = updates.begin();
 					i != updates.end(); ++i)
 				{
-					forward_standing(*i, istate, boost::weak_ptr<reputation_session>());
+					forward_standing(*i, istate, std::weak_ptr<reputation_session>());
 				}
 			}
 
@@ -3060,13 +3058,13 @@ namespace
 
 			key_desc_t msg_desc[] = {
 				{"r", bdecode_node::dict_t, 0, key_desc_t::parse_children},
-					{"id", bdecode_node::string_t, reputation_id::size, 0},
+					{"id", bdecode_node::string_t, reputation_id::size(), 0},
 					{"state", bdecode_node::dict_t, 0, key_desc_t::last_child},
 			};
 
 			bdecode_node msg_keys[3];
 			char error_string[200];
-			if (!verify_message(m, msg_desc, msg_keys, error_string, sizeof(error_string)))
+			if (!verify_message(m, msg_desc, msg_keys, error_string))
 			{
 				return bdecode_node();
 			}
@@ -3086,7 +3084,7 @@ namespace
 				return;
 			}
 
-			pubkey_type pk;
+			dht::public_key pk;
 			if (!pkey(intermediary->first, pk))
 			{
 				save_standing_updates(intermediary, recipient);
@@ -3127,18 +3125,18 @@ namespace
 		{
 #ifndef TORRENT_DISABLE_LOGGING
 			{
-				reputation_id intermediary_rid; rid(intermediary->first, intermediary_rid);
-				reputation_log("Get standing ack for peer %s", to_hex(intermediary_rid.to_string()));
+				//reputation_id intermediary_rid; rid(intermediary->first, intermediary_rid);
+				//reputation_log("Get standing ack for peer %s", to_hex(intermediary_rid.to_string()));
 			}
 #endif
 			bdecode_node state_entry = state_from_response(m);
-			if (state_entry != bdecode_node::dict_t)
+			if (state_entry.type() != bdecode_node::dict_t)
 			{
 				get_standing_failure(intermediary, recipient, addr);
 				return;
 			}
 
-			pubkey_type pk;
+			dht::public_key pk;
 			if (!pkey(intermediary->first, pk))
 			{
 				erase_get_standing(intermediary, recipient);
@@ -3177,16 +3175,16 @@ namespace
 		}
 
 		// The peer has no more credit to give at the intermediary
-		void peer_exhausted_at(boost::weak_ptr<reputation_session> peer, reputation_key intermediary);
-		void send_their_standing(boost::weak_ptr<reputation_session> peer
+		void peer_exhausted_at(std::weak_ptr<reputation_session> peer, reputation_key intermediary);
+		void send_their_standing(std::weak_ptr<reputation_session> peer
 			, reputation_id at, signed_state const& state);
 
 		void contact_info_failure(query_destinations::iterator intermediary)
 		{
 #ifndef TORRENT_DISABLE_LOGGING
 			{
-				reputation_id intermediary_rid; rid(intermediary->first, intermediary_rid);
-				reputation_log("Failed to get contact info for peer %s", to_hex(intermediary_rid.to_string()).c_str());
+				//reputation_id intermediary_rid; rid(intermediary->first, intermediary_rid);
+				//reputation_log("Failed to get contact info for peer %s", to_hex(intermediary_rid.to_string()).c_str());
 			}
 #endif
 			m_store.contact_failure(intermediary->first);
@@ -3252,7 +3250,7 @@ namespace
 
 				// Got it! create a new reputation_key and re-insert the
 				// standing updates under it
-				peer_rkey = establish_peer(alert.key, peer_rid, contact_info());
+				peer_rkey = establish_peer(dht::public_key(alert.key.data()), peer_rid, contact_info());
 				query_destinations::iterator new_intermediary =
 					m_datagram_queries.insert(std::make_pair(peer_rkey, i->second)).first;
 
@@ -3334,7 +3332,7 @@ namespace
 			if (intermediary == m_datagram_queries.end())
 			{
 #ifndef TORRENT_DISABLE_LOGGING
-				reputation_log("Couldn't find any queries for peer %s", to_hex(peer_rid.to_string()).c_str());
+				//reputation_log("Couldn't find any queries for peer %s", to_hex(peer_rid.to_string()).c_str());
 #endif
 				return;
 			}
@@ -3342,7 +3340,7 @@ namespace
 			if (intermediary->second.ci_status != ci_pending)
 			{
 #ifndef TORRENT_DISABLE_LOGGING
-				reputation_log("Got duplicate item for peer %s", to_hex(peer_rid.to_string()).c_str());
+				//reputation_log("Got duplicate item for peer %s", to_hex(peer_rid.to_string()).c_str());
 #endif
 				return;
 			}
@@ -3394,15 +3392,16 @@ namespace
 		{
 			if (m_ses.is_valid())
 			{
-				m_ses.dht_put_item(m_identity.key.pk
-					, boost::bind(&reputation_manager::put_client_ep, this, _1, _2, _3, _4));
+				m_ses.dht_put_item(m_identity.key.pk.bytes
+					, std::bind(&reputation_manager::put_client_ep_impl, this, _1, _2, _3, _4));
 			}
 			m_last_contact_info_put = clock_type::now();
 		}
 
-		void put_client_ep(entry& value
-			, boost::array<char,ed25519_signature_size>& sig
-			, boost::uint64_t& seq, std::string const& salt)
+		void put_client_ep_impl(entry& value
+			, std::array<char, 64>& sig
+			, std::int64_t& seq
+			, std::string const& salt)
 		{
 			if (m_ses.is_valid())
 			{
@@ -3415,24 +3414,23 @@ namespace
 				value.string().reserve(contact_info::v46_size);
 				ci.to_bytes(std::back_inserter(value.string()));
 
-				seq = std::max(boost::uint64_t(m_store.get_int64_value(store_ip_seq, 0))+1, seq+1);
+				seq = std::max(m_store.get_int64_value(store_ip_seq, 0)+1, seq+1);
 				m_store.set_int64_value(store_ip_seq, seq);
 
 				std::vector<char> buf;
 				bencode(std::back_inserter(buf), value);
-				dht::sign_mutable_item(
-					std::make_pair(buf.data(), buf.size())
-					, std::make_pair(salt.data(), salt.size())
-					, seq
-					, m_identity.key.pk.data()
-					, m_identity.key.sk.data()
-					, sig.data());
+				sig = dht::sign_mutable_item(
+					{ buf.data(), buf.size() }
+					, { salt.data(), salt.size() }
+					, dht::sequence_number(seq)
+					, m_identity.key.pk
+					, m_identity.key.sk).bytes;
 			}
 		}
 
-		boost::int64_t bytes_pending_download()
+		std::int64_t bytes_pending_download()
 		{
-			boost::int64_t global_bytes_remaining = 0;
+			std::int64_t global_bytes_remaining = 0;
 
 			if (m_ses.is_valid())
 			{
@@ -3483,9 +3481,9 @@ namespace
 		time_point m_last_state_peers_purge;
 		time_point m_last_xfer_history_rollover;
 		time_point m_last_standing_update_retry;
-		std::map<reputation_id, boost::weak_ptr<reputation_session> > m_sessions;
+		std::map<reputation_id, std::weak_ptr<reputation_session> > m_sessions;
 		session_handle m_ses;
-		boost::int64_t m_global_balance;
+		std::int64_t m_global_balance;
 		standing_queue_type m_standing_queue;
 		query_destinations m_datagram_queries;
 		lt_identify_plugin const& m_identity;
@@ -3495,7 +3493,7 @@ namespace
 		std::vector<get_standing_request_ctx*> m_outstanding_get_queries;
 	};
 
-	class reputation_session : public boost::enable_shared_from_this<reputation_session>
+	class reputation_session : public std::enable_shared_from_this<reputation_session>
 	{
 	public:
 		reputation_session(reputation_manager& repman, reputation_id rid)
@@ -3555,7 +3553,7 @@ namespace
 
 		peer_reputation const& reputation() const { return m_rep; }
 
-		void add_connection(boost::weak_ptr<reputation_peer_plugin> con)
+		void add_connection(std::weak_ptr<reputation_peer_plugin> con)
 		{
 			m_connections.push_back(con);
 		}
@@ -3566,7 +3564,7 @@ namespace
 			for (peer_connections::iterator i = m_connections.begin();
 				i != valid_end;)
 			{
-				boost::shared_ptr<reputation_peer_plugin> peer = i->lock();
+				std::shared_ptr<reputation_peer_plugin> peer = i->lock();
 				if (peer && peer.get() != con)
 					++i;
 				else
@@ -3576,7 +3574,7 @@ namespace
 			prune_connections(valid_end);
 		}
 
-		void establish_rkey(pubkey_type const& peer_key, contact_info ci)
+		void establish_rkey(dht::public_key const& peer_key, contact_info ci)
 		{
 			TORRENT_ASSERT(!has_rkey());
 			m_rkey = m_repman.establish_peer(peer_key, m_rid, ci);
@@ -3636,12 +3634,12 @@ namespace
 			return e;
 		}
 
-		boost::int64_t direct_credit_deficit() const
+		std::int64_t direct_credit_deficit() const
 		{
 			return m_payload_sent_this_session - m_payload_direct_credited_this_session;
 		}
 
-		boost::int64_t attributed_credit_deficit() const
+		std::int64_t attributed_credit_deficit() const
 		{
 			return m_payload_sent_this_session - m_payload_attributed_this_session;
 		}
@@ -3667,7 +3665,7 @@ namespace
 			return error_code();
 		}
 
-		void on_known_peers(buffer::const_interval body)
+		void on_known_peers(span<char const> body)
 		{
 			m_repman.consider_known_peers(body, m_mutual_intermediaries);
 			m_next_mutual_intermediary = m_mutual_intermediaries.begin();
@@ -3685,8 +3683,8 @@ namespace
 
 			for (int i = 0; i < msg.dict_size(); ++i)
 			{
-				std::pair<std::string, bdecode_node> standing = msg.dict_at(i);
-				if (standing.first.size() != reputation_id::size)
+				auto standing = msg.dict_at(i);
+				if (standing.first.size() != reputation_id::size())
 				{
 					return reputation_errors::invalid_standing_message;
 				}
@@ -3694,7 +3692,7 @@ namespace
 				reputation_key intermediary = m_repman.rkey(reputation_id(standing.first.data()));
 				if (!valid(intermediary))
 					continue;
-				pubkey_type pk;
+				dht::public_key pk;
 				if (!m_repman.pkey(intermediary, pk))
 					continue;
 
@@ -3706,7 +3704,7 @@ namespace
 					attributions_type::iterator existing_entry = std::find_if(
 						m_rep.attributions.begin()
 						, m_rep.attributions.end()
-						, boost::bind(&attribution::intermediary, _1) == intermediary);
+						, [&](attribution const& e) { return e.intermediary == intermediary; });
 
 					if (existing_entry == m_rep.attributions.end())
 						m_rep.attributions.push_back(attribution(intermediary, 0));
@@ -3731,8 +3729,8 @@ namespace
 
 			for (int i = 0; i < msg.dict_size(); ++i)
 			{
-				std::pair<std::string, bdecode_node> standing = msg.dict_at(i);
-				if (standing.first.size() != reputation_id::size)
+				auto standing = msg.dict_at(i);
+				if (standing.first.size() != reputation_id::size())
 				{
 					return reputation_errors::invalid_standing_message;
 				}
@@ -3740,7 +3738,7 @@ namespace
 				reputation_key intermediary = m_repman.rkey(reputation_id(standing.first.data()));
 				if (!valid(intermediary))
 					continue;
-				pubkey_type pk;
+				dht::public_key pk;
 				if (!m_repman.pkey(intermediary, pk))
 					continue;
 
@@ -3769,8 +3767,8 @@ namespace
 			int total_contribution = 0;
 			for (int i = 0; i < msg.dict_size(); ++i)
 			{
-				std::pair<std::string, bdecode_node> attrib = msg.dict_at(i);
-				if (attrib.first.size() != reputation_id::size
+				auto attrib = msg.dict_at(i);
+				if (attrib.first.size() != reputation_id::size()
 					|| attrib.second.type() != bdecode_node::int_t)
 				{
 					return reputation_errors::invalid_attribution_message;
@@ -3789,7 +3787,7 @@ namespace
 					attributions_type::iterator existing_entry
 						= std::find_if(m_remote_attributions.begin()
 							, m_remote_attributions.end()
-							, boost::bind(&attribution::intermediary, _1) == intermediary);
+							, [&](attribution const& e) { return e.intermediary == intermediary; });
 
 					if (existing_entry != m_remote_attributions.end())
 					{
@@ -3820,7 +3818,7 @@ namespace
 			reputation_manager::transaction t(m_repman);
 			establish_rkey();
 
-			pubkey_type pk;
+			dht::public_key pk;
 			if (!m_repman.pkey(rkey(), pk))
 			{
 				TORRENT_ASSERT(false);
@@ -3918,12 +3916,12 @@ namespace
 			if (!m_remote_attributions.empty())
 			{
 				entry::list_type& receipts = e["receipts"].list();
-				boost::int64_t payload_unattributed = m_payload_received_since_receipt;
-				boost::int64_t sequence = m_repman.next_receipt_sequence();
+				std::int64_t payload_unattributed = m_payload_received_since_receipt;
+				std::int64_t sequence = m_repman.next_receipt_sequence();
 				for (attributions_type::iterator i = m_remote_attributions.begin();
 					i != m_remote_attributions.end(); ++i)
 				{
-					boost::int64_t volume;
+					std::int64_t volume;
 					reputation_state intermediary_state;
 					if (i == --m_remote_attributions.end())
 						volume = payload_unattributed;
@@ -3951,14 +3949,14 @@ namespace
 
 					r["volume"] = volume;
 
-					boost::array<char, 256> verify_str;
-					int bsize = bencode(verify_str.begin(), e);
+					std::array<char, 256> verify_str;
+					std::size_t bsize = bencode(verify_str.begin(), e);
 					TORRENT_ASSERT(bsize < 256);
-					signature_type sig;
-					m_repman.sign(verify_str.data(), bsize, sig.data());
+					dht::signature sig;
+					m_repman.sign({ verify_str.data() , bsize }, sig);
 					r.erase("sender");
 					r.erase("recipient");
-					r["sig"] = std::string(sig.data(), signature_type::static_size);
+					r["sig"] = sig.bytes;
 
 					// TODO: Optimization opportunity once the codebase moves to C++11
 					// use emplace_back and std::move to move e into the list
@@ -4027,7 +4025,7 @@ namespace
 		void exhausted_intermediary(reputation_key intermediary);
 
 	private:
-		typedef std::vector<boost::weak_ptr<reputation_peer_plugin> > peer_connections;
+		typedef std::vector<std::weak_ptr<reputation_peer_plugin> > peer_connections;
 
 		void establish_rkey();
 
@@ -4051,7 +4049,7 @@ namespace
 		}
 #endif
 
-		void on_download_credit(boost::int64_t download_direct)
+		void on_download_credit(std::int64_t download_direct)
 		{
 			if (m_last_direct_download_state)
 			{
@@ -4067,9 +4065,9 @@ namespace
 		}
 
 		// process an intermediary receipt
-		error_code process_receipt(bdecode_node const& receipt, pubkey_type pk)
+		error_code process_receipt(bdecode_node const& receipt, dht::public_key pk)
 		{
-			if (receipt.data_section().second > 200)
+			if (receipt.data_section().size() > 200)
 			{
 				return reputation_errors::invalid_receipt_message;
 			}
@@ -4083,7 +4081,8 @@ namespace
 				std::vector<attribution>::iterator attrib
 					= std::find_if(m_rep.attributions.begin()
 						, m_rep.attributions.end()
-						, boost::bind(&attribution::intermediary, _1) == stored_standing.intermediary);
+						, [&](attribution const& e)
+							{ return e.intermediary == stored_standing.intermediary; });
 
 				if (attrib == m_rep.attributions.end()
 					|| attrib->credited
@@ -4123,14 +4122,14 @@ namespace
 		bool m_sent_known_peers:1;
 		bool m_observed:1;
 		time_point m_last_receipt_sent;
-		boost::int64_t m_payload_received_since_receipt;
-		boost::int64_t m_payload_received_this_session;
-		boost::int64_t m_payload_sent_since_db_update;
-		boost::int64_t m_payload_sent_since_receipt;
-		boost::int64_t m_payload_sent_this_session;
-		boost::int64_t m_payload_attributed_this_session;
-		boost::int64_t m_payload_direct_credited_this_session;
-		boost::int64_t m_last_direct_download_state;
+		std::int64_t m_payload_received_since_receipt;
+		std::int64_t m_payload_received_this_session;
+		std::int64_t m_payload_sent_since_db_update;
+		std::int64_t m_payload_sent_since_receipt;
+		std::int64_t m_payload_sent_this_session;
+		std::int64_t m_payload_attributed_this_session;
+		std::int64_t m_payload_direct_credited_this_session;
+		std::int64_t m_last_direct_download_state;
 
 		// the top max_attributions intermediaries known by both of us
 		// sorted in acending order by our observation count
@@ -4143,9 +4142,9 @@ namespace
 		peer_connections m_connections;
 	};
 
-	class reputation_peer_plugin
+	class reputation_peer_plugin final
 		: public peer_plugin
-		, public boost::enable_shared_from_this<reputation_peer_plugin>
+		, public std::enable_shared_from_this<reputation_peer_plugin>
 	{
 	public:
 		reputation_peer_plugin(reputation_manager& repman, bt_peer_connection_handle pc)
@@ -4164,9 +4163,9 @@ namespace
 				m_ses->remove_connection(this);
 		}
 
-		virtual char const* type() const { return "reputation"; }
+		string_view type() const override { return "reputation"; }
 
-		virtual void add_handshake(entry& h)
+		void add_handshake(entry& h) override
 		{
 			entry& messages = h["m"];
 			messages["lt_known_peers"] = 10;
@@ -4176,7 +4175,7 @@ namespace
 			messages["lt_receipt"] = 14;
 		}
 
-		virtual bool on_extension_handshake(bdecode_node const& h)
+		bool on_extension_handshake(bdecode_node const& h) override
 		{
 			bdecode_node messages = h.dict_find_dict("m");
 			if (!messages) return false;
@@ -4201,12 +4200,12 @@ namespace
 				&& m_receipt_msg_id))
 				return false;
 
-			ident_plugin->notify_on_identified(boost::bind(&reputation_peer_plugin::get_rid, this, _1));
+			ident_plugin->notify_on_identified(std::bind(&reputation_peer_plugin::get_rid, this, _1));
 
 			return true;;
 		}
 
-		virtual bool on_interested()
+		bool on_interested() override
 		{
 			if (m_pc.is_choked() && m_ses && !m_ses->reputation().valid())
 			{
@@ -4217,15 +4216,14 @@ namespace
 			return false;
 		}
 
-		virtual bool on_choke()
+		bool on_choke() override
 		{
 			if (m_pc.is_interesting() && m_ses)
 				m_ses->send_next_intermediary();
 			return false;
 		}
 
-		virtual bool on_extended(int length, int msg_id
-			, buffer::const_interval body)
+		bool on_extended(int length, int msg_id, span<char const> body) override
 		{
 			switch (msg_id)
 			{
@@ -4238,15 +4236,15 @@ namespace
 			}
 		}
 
-		virtual bool on_piece(peer_request const& piece
-			, disk_buffer_holder& /*data*/)
+		bool on_piece(peer_request const& piece
+			, span<char const> /*data*/) override
 		{
 			if (m_ses && m_ses->on_piece(piece.length))
 				send_receipt();
 			return false;
 		}
 
-		virtual void sent_unchoke()
+		void sent_unchoke() override
 		{
 			// we might be sending an unchoke before receiving the extension handshake
 			// or the identify message
@@ -4256,7 +4254,7 @@ namespace
 			m_ses->get_standing_at_attributions();
 		}
 
-		virtual void sent_payload(int bytes)
+		void sent_payload(int bytes) override
 		{
 			if (!m_ses)
 				return;
@@ -4317,7 +4315,7 @@ namespace
 				lt_identify_peer_plugin const* ident_plugin =
 					static_cast<lt_identify_peer_plugin const*>(m_pc.find_plugin("lt_identify"));
 				TORRENT_ASSERT(ident_plugin != NULL);
-				pubkey_type const* peer_key = ident_plugin->peer_key();
+				dht::public_key const* peer_key = ident_plugin->peer_key();
 				TORRENT_ASSERT(peer_key != NULL);
 				contact_info ci;
 				// Take a guess that the peer is listening for DHT requests on the same
@@ -4336,7 +4334,7 @@ namespace
 		{ return m_pc.associated_torrent(); }
 
 	private:
-		void on_known_peers(int /*length*/, buffer::const_interval body)
+		void on_known_peers(int /*length*/, span<char const> body)
 		{
 			TORRENT_ASSERT(m_my_standing_msg_id);
 			if (!m_pc.packet_finished() || !m_ses)
@@ -4360,7 +4358,7 @@ namespace
 			}
 		}
 
-		void on_my_standing(int /*length*/, buffer::const_interval body)
+		void on_my_standing(int /*length*/, span<char const> body)
 		{
 			TORRENT_ASSERT(m_receipt_msg_id);
 			if (!m_pc.packet_finished() || !m_ses)
@@ -4368,7 +4366,7 @@ namespace
 
 			bdecode_node msg;
 			error_code ec;
-			if (bdecode(body.begin, body.end, msg, ec) != 0)
+			if (bdecode(body.begin(), body.end(), msg, ec) != 0)
 			{
 				m_pc.disconnect(reputation_errors::invalid_standing_message, op_bittorrent, 2);
 				return;
@@ -4388,7 +4386,7 @@ namespace
 #endif
 		}
 
-		void on_your_standing(int /*length*/, buffer::const_interval body)
+		void on_your_standing(int /*length*/, span<char const> body)
 		{
 			if (!m_pc.packet_finished() || !m_ses)
 				return;
@@ -4399,7 +4397,7 @@ namespace
 
 			bdecode_node msg;
 			error_code ec;
-			if (bdecode(body.begin, body.end, msg, ec) != 0)
+			if (bdecode(body.begin(), body.end(), msg, ec) != 0)
 			{
 				m_pc.disconnect(reputation_errors::invalid_standing_message, op_bittorrent, 2);
 				return;
@@ -4413,7 +4411,7 @@ namespace
 			}
 		}
 
-		void on_attribution(int /*length*/, buffer::const_interval body)
+		void on_attribution(int /*length*/, span<char const> body)
 		{
 			TORRENT_ASSERT(m_receipt_msg_id);
 			if (!m_pc.packet_finished() || !m_ses)
@@ -4425,7 +4423,7 @@ namespace
 
 			bdecode_node msg;
 			error_code ec;
-			if (bdecode(body.begin, body.end, msg, ec) != 0)
+			if (bdecode(body.begin(), body.end(), msg, ec) != 0)
 			{
 				m_pc.disconnect(reputation_errors::invalid_attribution_message, op_bittorrent, 2);
 				return;
@@ -4439,7 +4437,7 @@ namespace
 			}
 		}
 
-		void on_receipt(int /*length*/, buffer::const_interval body)
+		void on_receipt(int /*length*/, span<char const> body)
 		{
 			if (!m_pc.packet_finished() || !m_ses)
 				return;
@@ -4450,7 +4448,7 @@ namespace
 
 			bdecode_node msg;
 			error_code ec;
-			if (bdecode(body.begin, body.end, msg, ec) != 0)
+			if (bdecode(body.begin(), body.end(), msg, ec) != 0)
 			{
 				m_pc.disconnect(reputation_errors::invalid_receipt_message, op_bittorrent, 2);
 				return;
@@ -4479,9 +4477,9 @@ namespace
 			peers.reserve(2000);
 			m_ses->known_peers(peers);
 			std::vector<char> body;
-			body.reserve(peers.size() * reputation_id::size + 6);
+			body.reserve(peers.size() * reputation_id::size() + 6);
 			std::back_insert_iterator<std::vector<char> > bi(body);
-			detail::write_uint32(peers.size() * reputation_id::size + 2, bi);
+			detail::write_uint32(peers.size() * reputation_id::size() + 2, bi);
 			detail::write_uint8(bt_peer_connection::msg_extended, bi);
 			detail::write_uint8(m_known_peers_msg_id, bi);
 			for (std::vector<reputation_id>::const_iterator i = peers.begin();
@@ -4522,11 +4520,10 @@ namespace
 
 		void get_rid(lt_identify_peer_plugin const& identity)
 		{
-			boost::array<char, ed25519_public_key_size> const* peer_key
-				= identity.peer_key();
+			auto peer_key = identity.peer_key();
 			if (peer_key)
 			{
-				reputation_id rid = hasher(peer_key->data(), peer_key->size()).final();
+				reputation_id rid = hasher(peer_key->bytes).final();
 				m_ses = m_repman.peer_session(rid);
 				m_ses->add_connection(shared_from_this());
 
@@ -4553,7 +4550,7 @@ namespace
 
 		reputation_manager& m_repman;
 		bt_peer_connection_handle m_pc;
-		boost::shared_ptr<reputation_session> m_ses;
+		std::shared_ptr<reputation_session> m_ses;
 		int m_known_peers_msg_id;
 		int m_my_standing_msg_id;
 		int m_your_standing_msg_id;
@@ -4561,49 +4558,43 @@ namespace
 		int m_receipt_msg_id;
 	};
 
-	bool reputation_manager::on_optimistic_unchoke(std::vector<peer_connection_handle>& peers)
+	//bool reputation_manager::on_optimistic_unchoke(std::vector<peer_connection_handle>& peers)
+	std::uint64_t reputation_manager::get_unchoke_priority(peer_connection_handle const& peer)
 	{
-		// only rank the top half of the vector to avoid unchoking peers too frequently
-		std::vector<std::pair<double, peer_connection_handle> > peer_reps;
-		peer_reps.reserve(peers.size() / 2);
+		// the maximum valid prioritie 2^63-1
+		static const std::uint64_t max_prio = std::numeric_limits<std::uint64_t>::max() / 2;
 
-		for (std::vector<peer_connection_handle>::iterator p = peers.begin()
-			, end = peers.begin() + peers.size() / 2; p != end; ++p)
-		{
-			double rep = 0.0;
-			reputation_peer_plugin const* peer_rep
-				= static_cast<reputation_peer_plugin const*>(p->find_plugin("reputation"));
-			if (peer_rep)
-			{
-				rep = peer_rep->reputation();
-			}
-			peer_reps.push_back(std::make_pair(rep, *p));
-		}
+		reputation_peer_plugin const* peer_rep
+			= static_cast<reputation_peer_plugin const*>(peer.find_plugin("reputation"));
 
-		std::stable_sort(peer_reps.begin(), peer_reps.end());
-		// reverse the vector so the result is sorted in decending order
-		std::transform(peer_reps.rbegin()
-			, peer_reps.rend()
-			, peers.begin()
-			, boost::bind(&std::pair<double, peer_connection_handle>::second, _1));
-		return false;
+		if (!peer_rep)
+			return std::numeric_limits<std::uint64_t>::max();
+
+		double rep = peer_rep->reputation();
+		if (rep > double(max_prio))
+			return 0;
+		if (rep < 1.0)
+			return max_prio;
+		return max_prio - std::uint64_t(rep);
 	}
 
+	reputation_manager::~reputation_manager() {}
+
 	void reputation_manager::peer_exhausted_at(
-		boost::weak_ptr<reputation_session> weak_peer
+		std::weak_ptr<reputation_session> weak_peer
 		, reputation_key intermediary)
 	{
-		boost::shared_ptr<reputation_session> peer = weak_peer.lock();
+		std::shared_ptr<reputation_session> peer = weak_peer.lock();
 		if (peer)
 			peer->exhausted_intermediary(intermediary);
 	}
 
 	void reputation_manager::send_their_standing(
-		boost::weak_ptr<reputation_session> weak_peer
+		std::weak_ptr<reputation_session> weak_peer
 		, reputation_id at
 		, signed_state const& state)
 	{
-		boost::shared_ptr<reputation_session> peer = weak_peer.lock();
+		std::shared_ptr<reputation_session> peer = weak_peer.lock();
 		if (peer)
 			peer->send_their_standing(at, state);
 	}
@@ -4614,7 +4605,7 @@ namespace
 		while (!m_standing_queue.empty()
 			&& m_standing_queue.front().first <= now)
 		{
-			boost::shared_ptr<reputation_session> session
+			std::shared_ptr<reputation_session> session
 				= m_standing_queue.front().second.lock();
 			if (session)
 				session->send_next_intermediary();
@@ -4632,7 +4623,7 @@ namespace
 		peer_connections::iterator i = m_connections.begin();
 		while (i != valid_end)
 		{
-			boost::shared_ptr<reputation_peer_plugin> peer = i->lock();
+			std::shared_ptr<reputation_peer_plugin> peer = i->lock();
 			TORRENT_ASSERT(peer);
 			if (peer)
 			{
@@ -4661,7 +4652,7 @@ namespace
 		peer_connections::iterator valid_end = m_connections.end();
 		while (valid_end != m_connections.begin())
 		{
-			boost::shared_ptr<reputation_peer_plugin> peer = m_connections.front().lock();
+			std::shared_ptr<reputation_peer_plugin> peer = m_connections.front().lock();
 			TORRENT_ASSERT(peer);
 			if (peer)
 			{
@@ -4678,8 +4669,8 @@ namespace
 	{
 #ifndef TORRENT_DISABLE_LOGGING
 		{
-			reputation_id intermediary_rid; m_repman.rid(intermediary, intermediary_rid);
-			session_log("Exhausted credit at %s", to_hex(intermediary_rid.to_string()).c_str());
+			//reputation_id intermediary_rid; m_repman.rid(intermediary, intermediary_rid);
+			//session_log("Exhausted credit at %s", to_hex(intermediary_rid.to_string()).c_str());
 		}
 #endif
 
@@ -4700,7 +4691,7 @@ namespace
 		for (peer_connections::iterator i = m_connections.begin();
 			i != valid_end;)
 		{
-			boost::shared_ptr<reputation_peer_plugin> peer = i->lock();
+			std::shared_ptr<reputation_peer_plugin> peer = i->lock();
 			TORRENT_ASSERT(peer);
 			if (peer)
 			{
@@ -4720,7 +4711,7 @@ namespace
 			peer_connections::iterator valid_end = m_connections.end();
 			while (valid_end != m_connections.begin())
 			{
-				boost::shared_ptr<reputation_peer_plugin> peer = m_connections.front().lock();
+				std::shared_ptr<reputation_peer_plugin> peer = m_connections.front().lock();
 				TORRENT_ASSERT(peer);
 				if (peer)
 				{
@@ -4738,7 +4729,7 @@ namespace
 	{
 		bool wanted = false;
 
-		session_handle session = m_repman.session();
+		session_handle const& session = m_repman.session();
 		int global_capacity = session.get_settings().get_int(settings_pack::download_rate_limit);
 		bool const global_bandwidth_available = global_capacity <= 0
 			|| session.status().download_rate < global_capacity * 90 / 100;
@@ -4747,7 +4738,7 @@ namespace
 		for (peer_connections::iterator i = m_connections.begin();
 			i != valid_end;)
 		{
-			boost::shared_ptr<reputation_peer_plugin> peer = i->lock();
+			std::shared_ptr<reputation_peer_plugin> peer = i->lock();
 			TORRENT_ASSERT(peer);
 			if (peer)
 			{
@@ -4772,14 +4763,14 @@ namespace
 		return wanted;
 	}
 
-	boost::shared_ptr<peer_plugin> reputation_torrent_plugin::new_connection(
+	std::shared_ptr<peer_plugin> reputation_torrent_plugin::new_connection(
 		peer_connection_handle const& pc)
 	{
-		if (pc.type() != peer_connection::bittorrent_connection)
-			return boost::shared_ptr<peer_plugin>();
+		if (pc.type() != connection_type::bittorrent)
+			return std::shared_ptr<peer_plugin>();
 
 		bt_peer_connection_handle c(pc);
-		return boost::shared_ptr<peer_plugin>(new reputation_peer_plugin(m_repman, c));
+		return std::shared_ptr<peer_plugin>(new reputation_peer_plugin(m_repman, c));
 	}
 
 void torrent_wait(bool& done, boost::mutex& mut, boost::condition_variable& cond)
@@ -4789,7 +4780,7 @@ void torrent_wait(bool& done, boost::mutex& mut, boost::condition_variable& cond
 }
 
 template <class R>
-void fun_ret(R& ret, bool& done, boost::condition_variable& e, boost::mutex& m, boost::function<R(void)> f)
+void fun_ret(R& ret, bool& done, boost::condition_variable& e, boost::mutex& m, std::function<R(void)> f)
 {
 	ret = f();
 	boost::unique_lock<boost::mutex> l(m);
@@ -4798,17 +4789,17 @@ void fun_ret(R& ret, bool& done, boost::condition_variable& e, boost::mutex& m, 
 }
 
 template <typename Ret>
-Ret sync_call_ret(session_handle ses, boost::function<Ret(void)> f)
+Ret sync_call_ret(session_handle ses, std::function<Ret(void)> f)
 {
 	bool done = false;
 	boost::mutex mut;
 	boost::condition_variable cond;
 	Ret r;
-	ses.get_io_service().dispatch(boost::bind(&fun_ret<Ret>
-		, boost::ref(r)
-		, boost::ref(done)
-		, boost::ref(cond)
-		, boost::ref(mut)
+	ses.get_io_service().dispatch(std::bind(&fun_ret<Ret>
+		, std::ref(r)
+		, std::ref(done)
+		, std::ref(cond)
+		, std::ref(mut)
 		, f));
 	torrent_wait(done, mut, cond);
 	return r;
@@ -4820,7 +4811,7 @@ double reputation_handle::global_ratio()
 {
 	reputation_manager* repman = static_cast<reputation_manager*>(reputation_plugin.get());
 	return sync_call_ret<double>(repman->session()
-		, boost::bind(&reputation_manager::global_ratio, repman));
+		, std::bind(&reputation_manager::global_ratio, repman));
 }
 
 reputation_handle create_reputation_plugin(lt_identify_plugin& identity
@@ -4830,15 +4821,15 @@ reputation_handle create_reputation_plugin(lt_identify_plugin& identity
 	try
 	{
 		return reputation_handle(
-			boost::make_shared<reputation_manager>(boost::ref(identity), storage_path, sk_password));
+			std::make_shared<reputation_manager>(std::ref(identity), storage_path, sk_password));
 	}
 	catch (reputation_exception)
 	{
-		return reputation_handle(boost::shared_ptr<reputation_manager>());
+		return reputation_handle(std::shared_ptr<reputation_manager>());
 	}
 	catch (db_init_error)
 	{
-		return reputation_handle(boost::shared_ptr<reputation_manager>());
+		return reputation_handle(std::shared_ptr<reputation_manager>());
 	}
 }
 

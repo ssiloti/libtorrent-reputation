@@ -9,14 +9,13 @@
 #define POLY1305_H
 
 #include <stdint.h>
-#include <vector>
-#include <boost/asio/buffer.hpp>
+#include <libtorrent/span.hpp>
 
 #define POLY1305_KEYLEN 32
 #define POLY1305_TAGLEN 16
 
 void poly1305_auth(unsigned char out[POLY1305_TAGLEN]
-	, std::vector<boost::asio::mutable_buffer> const& m
+	, libtorrent::span<libtorrent::span<char>> m
 	, const unsigned char key[POLY1305_KEYLEN]);
 
 #endif /* POLY1305_H */

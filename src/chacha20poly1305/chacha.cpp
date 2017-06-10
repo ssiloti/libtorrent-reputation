@@ -82,22 +82,20 @@ void chacha_ivsetup(chacha_ctx *x, const u8 *iv, unsigned int blkcnt)
 	x->input[15] = U8TO32_LITTLE(iv + 4);
 }
 
-using namespace boost::asio;
-
-int chacha_encrypt_bytes(chacha_ctx *x, std::vector<mutable_buffer> const& m_vec)
+int chacha_encrypt_bytes(chacha_ctx *x, libtorrent::span<libtorrent::span<char>> m_vec)
 {
 	u32 x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15;
 	u32 j0, j1, j2, j3, j4, j5, j6, j7, j8, j9, j10, j11, j12, j13, j14, j15;
 	u8 tmp[64];
 	unsigned int i;
-	size_t buf_bytes = 0, total_bytes = 0;
-	std::vector<mutable_buffer>::const_iterator buf = m_vec.begin();
+	std::size_t buf_bytes = 0, total_bytes = 0;
+	auto buf = m_vec.begin();
 	u8 *m;
 
 	if (buf != m_vec.end())
 	{
-		m = buffer_cast<u8*>(*buf);
-		total_bytes = buf_bytes = buffer_size(*buf);
+		m = reinterpret_cast<u8*>(buf->data());
+		total_bytes = buf_bytes = buf->size();
 	}
 
 	if (!buf_bytes) return 0;
@@ -123,13 +121,13 @@ int chacha_encrypt_bytes(chacha_ctx *x, std::vector<mutable_buffer> const& m_vec
 		u8 *mold;
 		if (buf_bytes < 64) {
 			for (i = 0;i < buf_bytes;++i) tmp[i] = m[i];
-			std::vector<mutable_buffer>::const_iterator buftmp = buf;
+			auto buftmp = buf;
 			while (i < 64)
 			{
 				if (++buftmp == m_vec.end())
 					break;
-				u8 *mtmp = buffer_cast<u8*>(*buftmp);
-				size_t bytestmp = buffer_size(*buftmp);
+				u8 *mtmp = reinterpret_cast<u8*>(buftmp->data());
+				std::size_t bytestmp = buftmp->size();
 				for (; i < 64 && bytestmp; i++, bytestmp--)
 					tmp[i] = *mtmp++;
 			}
@@ -224,8 +222,8 @@ int chacha_encrypt_bytes(chacha_ctx *x, std::vector<mutable_buffer> const& m_vec
 			buf_bytes = 0;
 			while (i < 64 && ++buf != m_vec.end())
 			{
-				m = buffer_cast<u8*>(*buf);
-				buf_bytes = buffer_size(*buf);
+				m = reinterpret_cast<u8*>(buf->data());
+				buf_bytes = buf->size();
 				total_bytes += buf_bytes;
 				for (; i < 64 && buf_bytes; i++, buf_bytes--)
 					*m++ = tmp[i];
@@ -242,8 +240,8 @@ int chacha_encrypt_bytes(chacha_ctx *x, std::vector<mutable_buffer> const& m_vec
 		if (!buf_bytes) {
 			if (++buf == m_vec.end())
 				break;
-			m = buffer_cast<u8*>(*buf);
-			buf_bytes = buffer_size(*buf);
+			m = reinterpret_cast<u8*>(buf->data());
+			buf_bytes = buf->size();
 			total_bytes += buf_bytes;
 		}
 	}

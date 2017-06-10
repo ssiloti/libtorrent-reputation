@@ -18,24 +18,22 @@
 #include "chacha20poly1305.hpp"
 #include <cassert>
 
-using namespace boost::asio;
-
-int crypto_secretbox(std::vector<boost::asio::mutable_buffer> const& m
+int crypto_secretbox(libtorrent::span<libtorrent::span<char>> m
 	, unsigned char tag[POLY1305_TAGLEN]
 	, const unsigned char *n
 	, const unsigned char *k)
 {
 	int i;
-	unsigned char subkey[POLY1305_KEYLEN];
+	std::array<char, POLY1305_KEYLEN> subkey;
 	chacha_ctx ctx;
 	for (i = 0;i < POLY1305_KEYLEN;++i) subkey[i] = 0;
 	chacha_keysetup(&ctx,k,crypto_secretbox_KEYBYTES*8);
 	chacha_ivsetup(&ctx,n,0);
-	std::vector<mutable_buffer> subkey_vec(1,mutable_buffer(subkey, POLY1305_KEYLEN));
-	chacha_encrypt_bytes(&ctx,subkey_vec);
+	libtorrent::span<char> subkey_span(subkey);
+	chacha_encrypt_bytes(&ctx, { &subkey_span, 1 });
 	chacha_ivsetup(&ctx,n,1);
 	int encrypted_bytes = chacha_encrypt_bytes(&ctx,m);
-	poly1305_auth(tag,m,subkey);
+	poly1305_auth(tag,m,(unsigned char*)subkey.data());
 	return encrypted_bytes;
 }
 
@@ -62,21 +60,21 @@ int crypto_verify_16(const unsigned char *x,const unsigned char *y)
   return (1 & ((differentbits - 1) >> 8)) - 1;
 }
 
-int crypto_secretbox_open(std::vector<boost::asio::mutable_buffer> const& c
+int crypto_secretbox_open(libtorrent::span<libtorrent::span<char>> c
 	, unsigned char tag[POLY1305_TAGLEN]
 	, const unsigned char *n
 	, const unsigned char *k)
 {
 	int i;
-	unsigned char subkey[POLY1305_KEYLEN];
+	std::array<char, POLY1305_KEYLEN> subkey;
 	unsigned char polytag[POLY1305_TAGLEN];
 	chacha_ctx ctx;
 	for (i = 0;i < POLY1305_KEYLEN;++i) subkey[i] = 0;
 	chacha_keysetup(&ctx,k,crypto_secretbox_KEYBYTES*8);
 	chacha_ivsetup(&ctx,n,0);
-	std::vector<mutable_buffer> subkey_vec(1,mutable_buffer(subkey, POLY1305_KEYLEN));
-	chacha_encrypt_bytes(&ctx,subkey_vec);
-	poly1305_auth(polytag,c,subkey);
+	libtorrent::span<char> subkey_span(subkey);
+	chacha_encrypt_bytes(&ctx, { &subkey_span, 1 });
+	poly1305_auth(polytag,c,(unsigned char*)subkey.data());
 	if (crypto_verify_16(polytag,tag) != 0) return -1;
 	chacha_ivsetup(&ctx,n,1);
 	return chacha_encrypt_bytes(&ctx,c);

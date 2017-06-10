@@ -9,8 +9,7 @@ Public domain.
 #ifndef CHACHA_HPP
 #define CHACHA_HPP
 
-#include <vector>
-#include <boost/asio/buffer.hpp>
+#include <libtorrent/span.hpp>
 
 struct chacha_ctx {
 	unsigned int input[16];
@@ -24,7 +23,7 @@ struct chacha_ctx {
 
 void chacha_keysetup(struct chacha_ctx *x, const unsigned char *k, unsigned int kbits);
 void chacha_ivsetup(struct chacha_ctx *x, const unsigned char *iv, unsigned int blkcnt);
-int chacha_encrypt_bytes(struct chacha_ctx *x, std::vector<boost::asio::mutable_buffer> const& m);
+int chacha_encrypt_bytes(struct chacha_ctx *x, libtorrent::span<libtorrent::span<char>> m);
 
 #endif	/* CHACHA_H */
 

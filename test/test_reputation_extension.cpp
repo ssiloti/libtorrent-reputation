@@ -30,47 +30,255 @@ POSSIBILITY OF SUCH DAMAGE.
 
 */
 
-#define TORRENT_SESSION_HPP_INCLUDED
-#define TORRENT_PEER_CONNECTION_HANDLE_HPP_INCLUDED
-#define TORRENT_BT_PEER_CONNECTION_HPP_INCLUDED
-#define TORRENT_LT_IDENTIFY_HPP_INCLUDED
+//#define TORRENT_SESSION_HPP_INCLUDED
+//#define TORRENT_PEER_CONNECTION_HANDLE_HPP_INCLUDED
+//#define TORRENT_BT_PEER_CONNECTION_HPP_INCLUDED
+//#define TORRENT_LT_IDENTIFY_HPP_INCLUDED
+//#define TORRENT_EXTENSIONS_HPP_INCLUDED
 //#include "libtorrent/session.hpp"
 #include "test.hpp"
 
-//#include "libtorrent/extensions/lt_identify.hpp"
-//#include "libtorrent/extensions/reputation_manager.hpp"
-#include <libtorrent/peer_connection_interface.hpp>
-#include <libtorrent/extensions.hpp>
-
 // any headers which reference peer_connection must be included before the
 // mockups to avoid ambiguous references
-//#include <libtorrent/session_handle.hpp>
+#include <map>
+#include <vector>
+#include <limits>
+#include <queue>
+#include <sqlite3.h>
+
+#ifdef _MSC_VER
+#pragma warning(push, 1)
+#endif
+
+#include <boost/thread/condition_variable.hpp>
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
+#include <libtorrent/extensions/lt_identify.hpp>
+#include <libtorrent/session_handle.hpp>
 #include <libtorrent/kademlia/msg.hpp>
 #include <libtorrent/kademlia/item.hpp>
-//#include <libtorrent/peer_connection_handle.hpp>
-//#include <libtorrent/bt_peer_connection.hpp> // for bt_peer_connection::msg_extended
+#include <libtorrent/peer_connection_handle.hpp>
+#include <libtorrent/bt_peer_connection.hpp> // for bt_peer_connection::msg_extended
 #include <libtorrent/sha1_hash.hpp>
 #include <libtorrent/io.hpp>
 #include <libtorrent/bdecode.hpp>
 #include <libtorrent/bencode.hpp>
+#include <libtorrent/entry.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/session_status.hpp>
-#include <libtorrent/ed25519.hpp>
+#include <libtorrent/kademlia/ed25519.hpp>
 
 #include <libtorrent/alert_manager.hpp>
 
-namespace libtorrent
+namespace libtorrent {
+
+	namespace { class reputation_peer_plugin; }
+
+namespace mocks
 {
+	struct torrent_handle;
+	struct session_handle;
+	struct bt_peer_connection_handle;
+	typedef bt_peer_connection_handle peer_connection_handle;
+
+	struct torrent_plugin;
+
+	struct plugin
+	{
+		// hidden
+		virtual ~plugin() {}
+
+		// these are flags that can be returned by implemented_features()
+		// indicating which callbacks this plugin is interested in
+		enum feature_flags_t
+		{
+			// include this bit if your plugin needs to alter the order of the
+			// optimistic unchoke of peers. i.e. have the on_optimistic_unchoke()
+			// callback be called.
+			optimistic_unchoke_feature = 1,
+
+			// include this bit if your plugin needs to have on_tick() called
+			tick_feature = 2,
+
+			// include this bit if your plugin needs to have on_dht_request()
+			// called
+			dht_request_feature = 4,
+
+			// include this bit if your plugin needs to have on_alert()
+			// called
+			alert_feature = 8,
+		};
+
+		// This function is expected to return a bitmask indicating which features
+		// this plugin implements. Some callbacks on this object may not be called
+		// unless the corresponding feature flag is returned here. Note that
+		// callbacks may still be called even if the corresponding feature is not
+		// specified in the return value here. See feature_flags_t for possible
+		// flags to return.
+		virtual std::uint32_t implemented_features() { return 0; }
+
+		// this is called by the session every time a new torrent is added.
+		// The ``torrent*`` points to the internal torrent object created
+		// for the new torrent. The ``void*`` is the userdata pointer as
+		// passed in via add_torrent_params.
+		//
+		// If the plugin returns a torrent_plugin instance, it will be added
+		// to the new torrent. Otherwise, return an empty shared_ptr to a
+		// torrent_plugin (the default).
+		virtual std::shared_ptr<torrent_plugin> new_torrent(torrent_handle const&, void*)
+		{
+			return std::shared_ptr<torrent_plugin>();
+		}
+
+		// called when plugin is added to a session
+		virtual void added(session_handle const&) {}
+
+		// called when a dht request is received.
+		// If your plugin expects this to be called, make sure to include the flag
+		// ``dht_request_feature`` in the return value from implemented_features().
+		virtual bool on_dht_request(string_view /* query */
+			, udp::endpoint const& /* source */, bdecode_node const& /* message */
+			, entry& /* response */)
+		{
+			return false;
+		}
+
+		// called when an alert is posted alerts that are filtered are not posted.
+		// If your plugin expects this to be called, make sure to include the flag
+		// ``alert_feature`` in the return value from implemented_features().
+		virtual void on_alert(alert const*) {}
+
+		// return true if the add_torrent_params should be added
+		virtual bool on_unknown_torrent(sha1_hash const& /* info_hash */
+			, peer_connection_handle const& /* pc */, add_torrent_params& /* p */)
+		{
+			return false;
+		}
+
+		// called once per second.
+		// If your plugin expects this to be called, make sure to include the flag
+		// ``tick_feature`` in the return value from implemented_features().
+		virtual void on_tick() {}
+
+		// called when choosing peers to optimistically unchoke. The return value
+		// indicates the peer's priority for unchoking. Lower return values
+		// correspond to higher priority. Priorities above 2^63-1 are reserved.
+		// If your plugin has no priority to assign a peer it should return 2^64-1.
+		// If your plugin expects this to be called, make sure to include the flag
+		// ``optimistic_unchoke_feature`` in the return value from implemented_features().
+		// If multiple plugins implement this function the lowest return value
+		// (i.e. the highest priority) is used.
+		virtual uint64_t get_unchoke_priority(peer_connection_handle const& /* peer */)
+		{
+			return std::numeric_limits<uint64_t>::max();
+		}
+
+		// called when saving settings state
+		virtual void save_state(entry&) {}
+
+		// called when loading settings state
+		virtual void load_state(bdecode_node const&) {}
+	};
+
+	// Torrent plugins are associated with a single torrent and have a number
+	// of functions called at certain events. Many of its functions have the
+	// ability to change or override the default libtorrent behavior.
+	struct torrent_plugin
+	{
+		// hidden
+		virtual ~torrent_plugin() {}
+
+		// This function is called each time a new peer is connected to the torrent. You
+		// may choose to ignore this by just returning a default constructed
+		// ``shared_ptr`` (in which case you don't need to override this member
+		// function).
+		//
+		// If you need an extension to the peer connection (which most plugins do) you
+		// are supposed to return an instance of your peer_plugin class. Which in
+		// turn will have its hook functions called on event specific to that peer.
+		//
+		// The ``peer_connection_handle`` will be valid as long as the ``shared_ptr``
+		// is being held by the torrent object. So, it is generally a good idea to not
+		// keep a ``shared_ptr`` to your own peer_plugin. If you want to keep references
+		// to it, use ``weak_ptr``.
+		//
+		// If this function throws an exception, the connection will be closed.
+		virtual std::shared_ptr<peer_plugin> new_connection(peer_connection_handle const&)
+		{
+			return std::shared_ptr<peer_plugin>();
+		}
+
+		// These hooks are called when a piece passes the hash check or fails the hash
+		// check, respectively. The ``index`` is the piece index that was downloaded.
+		// It is possible to access the list of peers that participated in sending the
+		// piece through the ``torrent`` and the ``piece_picker``.
+		virtual void on_piece_pass(piece_index_t /*index*/) {}
+		virtual void on_piece_failed(piece_index_t /*index*/) {}
+
+		// This hook is called approximately once per second. It is a way of making it
+		// easy for plugins to do timed events, for sending messages or whatever.
+		virtual void tick() {}
+
+		// These hooks are called when the torrent is paused and unpaused respectively.
+		// The return value indicates if the event was handled. A return value of
+		// ``true`` indicates that it was handled, and no other plugin after this one
+		// will have this hook function called, and the standard handler will also not be
+		// invoked. So, returning true effectively overrides the standard behavior of
+		// pause or unpause.
+		//
+		// Note that if you call ``pause()`` or ``resume()`` on the torrent from your
+		// handler it will recurse back into your handler, so in order to invoke the
+		// standard handler, you have to keep your own state on whether you want standard
+		// behavior or overridden behavior.
+		virtual bool on_pause() { return false; }
+		virtual bool on_resume() { return false; }
+
+		// This function is called when the initial files of the torrent have been
+		// checked. If there are no files to check, this function is called immediately.
+		//
+		// i.e. This function is always called when the torrent is in a state where it
+		// can start downloading.
+		virtual void on_files_checked() {}
+
+		// called when the torrent changes state
+		// the state is one of torrent_status::state_t
+		// enum members
+		virtual void on_state(int /*s*/) {}
+
+		// called every time policy::add_peer is called
+		// src is a bitmask of which sources this peer
+		// has been seen from. flags is a bitmask of:
+
+		enum flags_t {
+			// this is the first time we see this peer
+			first_time = 1,
+			// this peer was not added because it was
+			// filtered by the IP filter
+			filtered = 2
+		};
+
+		// called every time a new peer is added to the peer list.
+		// This is before the peer is connected to. For ``flags``, see
+		// torrent_plugin::flags_t. The ``source`` argument refers to
+		// the source where we learned about this peer from. It's a
+		// bitmask, because many sources may have told us about the same
+		// peer. For peer source flags, see peer_info::peer_source_flags.
+		virtual void on_add_peer(tcp::endpoint const&,
+			int /*src*/, int /*flags*/) {}
+	};
 
 	struct lt_identify_keypair
 	{
-		boost::array<char, 64> sk;
-		boost::array<char, 32> pk;
+		dht::secret_key sk;
+		dht::public_key pk;
 	};
 
 	struct lt_identify_peer_plugin : peer_plugin
 	{
-		lt_identify_peer_plugin(boost::array<char, 32> const& k)
+		lt_identify_peer_plugin(dht::public_key const& k)
 			: pk(k)
 		{}
 
@@ -79,17 +287,17 @@ namespace libtorrent
 			return true;
 		}
 
-		boost::array<char, 32> const* peer_key() const
+		dht::public_key const* peer_key() const
 		{
 			return &pk;
 		}
 
-		void notify_on_identified(boost::function<void(lt_identify_peer_plugin const&)> cb) const
+		void notify_on_identified(std::function<void(lt_identify_peer_plugin const&)> cb) const
 		{
 			cb(*this);
 		}
 
-		boost::array<char, 32> const& pk;
+		dht::public_key const& pk;
 	};
 
 	struct lt_identify_plugin : plugin
@@ -97,24 +305,19 @@ namespace libtorrent
 		// populate key with a random key pair
 		void create_keypair()
 		{
-			boost::array<unsigned char, 32> seed;
-			ed25519_create_seed(seed.data());
-			create_keypair(seed);
+			create_keypair(dht::ed25519_create_seed());
 		}
 
 		// populate key using the given prng seed
-		void create_keypair(boost::array<unsigned char, 32> const& seed)
+		void create_keypair(std::array<char, 32> const& seed)
 		{
-			ed25519_create_keypair((unsigned char*)key.pk.data()
-				, (unsigned char*)key.sk.data(), seed.data());
+			std::tie(key.pk, key.sk) = dht::ed25519_create_keypair(seed);
 		}
 
 		// the key pair to use as the client's identity
 		lt_identify_keypair key;
 	};
 
-namespace
-{
 	namespace asio = boost::asio;
 
 	time_point current_time = ::libtorrent::clock_type::now();
@@ -123,10 +326,6 @@ namespace
 	{
 		static time_point now() { return current_time; }
 	};
-
-//	time_point const& time_now() { return current_time; }
-
-	class reputation_peer_plugin;
 
 	struct torrent_handle
 	{
@@ -156,24 +355,14 @@ namespace
 		enum { msg_extended = 20 };
 	};
 
-	struct peer_connection
-	{
-		enum connection_type
-		{
-			bittorrent_connection = 0,
-			url_seed_connection = 1,
-			http_seed_connection = 2
-		};
-	};
-
 	struct bt_peer_connection_mock_impl
 	{
-		bt_peer_connection_mock_impl(boost::array<char, 32> const& k);
+		bt_peer_connection_mock_impl(dht::public_key const& k);
 
 		lt_identify_peer_plugin identity;
 		tcp::endpoint m_remote;
 		std::vector<std::pair<std::vector<char>, int> > sent_buffers;
-		boost::shared_ptr<reputation_peer_plugin> rep;
+		std::shared_ptr<reputation_peer_plugin> rep;
 		torrent_handle m_torrent;
 		int sent_chokes;
 
@@ -191,12 +380,12 @@ namespace
 			: m_impl(impl)
 		{}
 
-		peer_plugin const* find_plugin(char const* type);
+		peer_plugin const* find_plugin(char const* type) const;
 
 		bool ignore_unchoke_slots() const { return false; }
 		void choke_this_peer() { m_impl->sent_chokes++; }
 
-		int type() const { return peer_connection::bittorrent_connection; }
+		connection_type type() const { return connection_type::bittorrent; }
 
 		bool is_choked() { return m_impl->choked; }
 		bool is_interesting() { return m_impl->interesting; }
@@ -228,10 +417,6 @@ namespace
 		bt_peer_connection_mock_impl* m_impl;
 	};
 
-	typedef bt_peer_connection_handle peer_connection_handle;
-
-	struct disk_buffer_holder {};
-
 	struct dht_direct_request_t
 	{
 		boost::asio::ip::udp::endpoint ep;
@@ -239,7 +424,7 @@ namespace
 		void* userdata;
 	};
 
-	bt_peer_connection_mock_impl::bt_peer_connection_mock_impl(boost::array<char, 32> const& k)
+	bt_peer_connection_mock_impl::bt_peer_connection_mock_impl(dht::public_key const& k)
 		: identity(k)
 		, m_torrent(boost::int64_t(0), boost::int64_t(0), torrent_status::downloading)
 		, sent_chokes(0)
@@ -261,8 +446,7 @@ namespace
 		void post_alerts()
 		{
 			std::vector<alert*> alerts;
-			int num_resume;
-			m_pending_dht_alerts.get_all(alerts, num_resume);
+			m_pending_dht_alerts.get_all(alerts);
 			for (std::vector<alert*>::iterator i = alerts.begin();
 			i != alerts.end(); ++i)
 			{
@@ -299,47 +483,47 @@ namespace
 			m_impl->m_dht_direct_requests.push_back(r);
 		}
 
-		void dht_get_item(boost::array<char, 32> key
+		void dht_get_item(std::array<char, 32> key
 			, std::string salt = std::string())
 		{
 			for (std::vector<dht::item>::iterator i = m_impl->m_dht_store.begin();
 			i != m_impl->m_dht_store.end(); ++i)
 			{
-				if (i->pk() == key && i->salt() == salt)
+				if (i->pk().bytes == key && i->salt() == salt)
 				{
 					m_impl->m_pending_dht_alerts.emplace_alert<dht_mutable_item_alert>(
-						i->pk(), i->sig(), i->seq(), i->salt(), i->value(), true);
+						i->pk().bytes, i->sig().bytes, i->seq().value, i->salt(), i->value(), true);
 					return;
 				}
 			}
 			m_impl->m_pending_dht_alerts.emplace_alert<dht_mutable_item_alert>(
-				key, boost::array<char, 64>(), 0, salt, entry(), true);
+				key, std::array<char, 64>(), 0, salt, entry(), true);
 		}
 
-		void dht_put_item(boost::array<char, 32> key
-			, boost::function<void(entry&, boost::array<char, 64>&
-			, boost::uint64_t&, std::string const&)> cb
+		void dht_put_item(std::array<char, 32> key
+			, std::function<void(entry&, std::array<char, 64>&
+			, boost::int64_t&, std::string const&)> cb
 			, std::string salt = std::string())
 		{
 			for (std::vector<dht::item>::iterator i = m_impl->m_dht_store.begin();
 			i != m_impl->m_dht_store.end(); ++i)
 			{
-				if (i->pk() == key && i->salt() == salt)
+				if (i->pk().bytes == key && i->salt() == salt)
 				{
 					entry value = i->value();
-					boost::array<char, 64> sig = i->sig();
-					boost::uint64_t seq = i->seq();
-					cb(value, sig, seq, salt);
-					i->assign(value, salt, seq, key.data(), sig.data());
+					auto sig = i->sig();
+					auto seq = i->seq();
+					cb(value, sig.bytes, seq.value, salt);
+					i->assign(value, salt, seq, i->pk(), sig);
 					return;
 				}
 			}
 			entry value;
-			boost::array<char, 64> sig;
-			boost::uint64_t seq = 0;
-			cb(value, sig, seq, salt);
+			dht::signature sig;
+			dht::sequence_number seq;
+			cb(value, sig.bytes, seq.value, salt);
 			dht::item i;
-			i.assign(value, salt, seq, key.data(), sig.data());
+			i.assign(value, salt, seq, dht::public_key(key.data()), sig);
 			m_impl->m_dht_store.push_back(i);
 		}
 
@@ -380,19 +564,50 @@ namespace
 		return test_time;
 	}
 
-} // namespace
+} // namespace mocks
 
 } // namespace libtorrent
 
 #define TORRENT_DISABLE_LOGGING
 #define TORRENT_REPUTATION_MANAGER_TEST
+
+#define plugin mocks::plugin
+#define torrent_plugin mocks::torrent_plugin
+#define lt_identify_keypair mocks::lt_identify_keypair
+#define lt_identify_peer_plugin mocks::lt_identify_peer_plugin
+#define lt_identify_plugin mocks::lt_identify_plugin
+#define torrent_handle mocks::torrent_handle
+#define session_handle mocks::session_handle
+#define bt_peer_connection_handle mocks::bt_peer_connection_handle
+#define peer_connection_handle mocks::peer_connection_handle
+#define bt_peer_connection mocks::bt_peer_connection
+#define dht_direct_request_t mocks::dht_direct_request_t
+#define clock_type mocks::clock_type
+#define current_time mocks::current_time
+#define time mocks::time
+
 #include "../src/reputation_manager.cpp"
+
+#undef plugin
+#undef torrent_plugin
+#undef lt_identify_keypair
+#undef lt_identify_peer_plugin
+#undef lt_identify_plugin
+#undef torrent_handle
+#undef session_handle
+#undef bt_peer_connection_handle
+#undef peer_connection_handle
+#undef bt_peer_connection
+#undef dht_direct_request_t
+#undef clock_type
+#undef current_time
+#undef time
 
 namespace libtorrent
 {
-namespace
+namespace mocks
 {
-	peer_plugin const* bt_peer_connection_handle::find_plugin(char const* type)
+	peer_plugin const* bt_peer_connection_handle::find_plugin(char const* type) const
 	{
 		if (strcmp(type, "lt_identify") == 0)
 			return &m_impl->identity;
@@ -413,12 +628,9 @@ namespace
 			: connection(key.pk)
 			, sequence(0)
 		{
-			boost::array<unsigned char, ed25519_seed_size> seed;
-			ed25519_create_seed(seed.data());
-			ed25519_create_keypair((unsigned char*)key.pk.data()
-				, (unsigned char*)key.sk.data()
-				, seed.data());
-			rid = hasher(key.pk.data(), key.pk.size()).final();
+			std::tie(key.pk, key.sk) = dht::ed25519_create_keypair(
+				dht::ed25519_create_seed());
+			rid = hasher(key.pk.bytes).final();
 		}
 
 		lt_identify_keypair key;
@@ -432,9 +644,9 @@ namespace
 	struct test_client
 	{
 		test_client()
-			: identity(boost::make_shared<lt_identify_plugin>())
+			: identity(std::make_shared<lt_identify_plugin>())
 			, repman_hnd(create_reputation_plugin(*identity, ".", ""))
-			, ses(boost::make_shared<session_mock_impl>(boost::ref(dht_store)))
+			, ses(std::make_shared<session_mock_impl>(std::ref(dht_store)))
 		{
 			ses->m_listen_port = 1;
 			ses->m_rep_plugin = repman_hnd.reputation_plugin.get();
@@ -444,10 +656,10 @@ namespace
 		reputation_manager& repman()
 		{ return *static_cast<reputation_manager*>(repman_hnd.reputation_plugin.get()); }
 
-		boost::shared_ptr<lt_identify_plugin> identity;
+		std::shared_ptr<lt_identify_plugin> identity;
 		reputation_handle repman_hnd;
 		std::vector<dht::item> dht_store;
-		boost::shared_ptr<session_mock_impl> ses;
+		std::shared_ptr<session_mock_impl> ses;
 	};
 
 	std::pair<stored_standing_update, signed_state> generate_forward_standing(
@@ -465,13 +677,11 @@ namespace
 		{
 			std::vector<char> sig_buf;
 			bencode(std::back_inserter(sig_buf), e);
-			char sig[ed25519_signature_size];
-			ed25519_sign((unsigned char*)sig
-				, (unsigned char*)sig_buf.data()
-				, sig_buf.size()
-				, (unsigned char*)recipient.key.pk.data()
-				, (unsigned char*)recipient.key.sk.data());
-			e["sig"] = std::string(sig, ed25519_signature_size);
+			dht::signature sig;
+			sig = dht::ed25519_sign(sig_buf
+				, recipient.key.pk
+				, recipient.key.sk);
+			e["sig"] = sig.bytes;
 		}
 
 		standing_update update(e, repman.client_rid(), recipient.rid, recipient.key.pk);
@@ -520,13 +730,9 @@ namespace
 
 				std::vector<char> sig_buf;
 				bencode(std::back_inserter(sig_buf), reply["r"]["state"]);
-				char sig[ed25519_signature_size];
-				ed25519_sign((unsigned char*)sig
-					, (unsigned char*)sig_buf.data()
-					, sig_buf.size()
-					, (unsigned char*)kp.pk.data()
-					, (unsigned char*)kp.sk.data());
-				reply["r"]["state"]["sig"] = std::string(sig, ed25519_signature_size);
+				dht::signature sig;
+				sig = dht::ed25519_sign(sig_buf, kp.pk, kp.sk);
+				reply["r"]["state"]["sig"] = sig.bytes;
 			}
 			std::vector<char> lazy_buf;
 			bencode(std::back_inserter(lazy_buf), reply);
@@ -560,14 +766,14 @@ namespace
 		return 0;
 	}
 
-	typedef boost::array<test_identity, 3> peer_ids_t;
+	typedef std::array<test_identity, 3> peer_ids_t;
 	void create_test_peers(reputation_manager& repman, peer_ids_t& peers)
 	{
 		for (peer_ids_t::iterator i = peers.begin();
 			i != peers.end(); ++i)
 		{
-			i->connection.rep = boost::make_shared<reputation_peer_plugin>(
-				boost::ref(repman)
+			i->connection.rep = std::make_shared<reputation_peer_plugin>(
+				std::ref(repman)
 				, bt_peer_connection_handle(&i->connection));
 			i->ci.addr_v4 = asio::ip::address_v4::from_string("1.2.3.4");
 			i->ci.port = std::distance(peers.begin(), i);
@@ -601,7 +807,7 @@ namespace
 
 			TEST_EQUAL(i->rkey, repman.rkey(i->rid));
 
-			pubkey_type temp_pkey;
+			dht::public_key temp_pkey;
 			repman.pkey(i->rkey, temp_pkey);
 			TEST_CHECK(temp_pkey == i->key.pk);
 		}
@@ -626,11 +832,7 @@ namespace
 			entry e = peer_state.reputation_state::to_entry();
 			std::vector<char> state_buf;
 			bencode(std::back_inserter(state_buf), e);
-			ed25519_sign((unsigned char*)peer_state.sig.data(),
-				(unsigned char const*)state_buf.data(),
-				state_buf.size(),
-				(unsigned char const*)i->key.pk.data(),
-				(unsigned char const*)i->key.sk.data());
+			peer_state.sig = dht::ed25519_sign(state_buf, i->key.pk, i->key.sk);
 			repman.store_state(i->rkey, client_reputation_key, peer_state);
 		}
 	}
@@ -697,11 +899,10 @@ namespace
 		TEST_EQUAL(sstate.download_referred, 12);
 		std::vector<char> state_buf;
 		bencode(std::back_inserter(state_buf), sstate.reputation_state::to_entry());
-		int valid = ed25519_verify((unsigned char*)sstate.sig.data()
-			, (unsigned char*)state_buf.data()
-			, state_buf.size()
-			, (unsigned char*)tc.identity->key.pk.data());
-		TEST_EQUAL(valid, 1);
+		bool valid = dht::ed25519_verify(sstate.sig
+			, state_buf
+			, tc.identity->key.pk);
+		TEST_CHECK(valid);
 
 		TEST_EQUAL(tc.repman().direct_value(i.rkey)
 			, double(sstate.download_direct - sstate.upload_direct + sstate.download_referred - sstate.upload_referred)
@@ -769,11 +970,9 @@ namespace
 			state.download_referred = 6;
 			std::vector<char> state_buf;
 			bencode(std::back_inserter(state_buf), state.reputation_state::to_entry());
-			ed25519_sign((unsigned char*)state.sig.data(),
-				(unsigned char const*)state_buf.data(),
-				state_buf.size(),
-				(unsigned char const*)intermediary.key.pk.data(),
-				(unsigned char const*)intermediary.key.sk.data());
+			state.sig = dht::ed25519_sign(state_buf
+				, intermediary.key.pk
+				, intermediary.key.sk);
 			tc.repman().store_state(intermediary.rkey, i.rkey, state);
 		}
 
@@ -798,7 +997,7 @@ namespace
 
 		test_identity& i = peer_ids[0];
 		signed_state state;
-		state.subject = hasher(tc.identity->key.pk.data(), tc.identity->key.pk.size()).final();
+		state.subject = hasher(tc.identity->key.pk.bytes).final();
 		state.upload_direct = 10;
 		state.download_direct = 20;
 		state.upload_recommended = 30;
@@ -807,14 +1006,12 @@ namespace
 		state.download_referred = 60;
 		std::vector<char> state_buf;
 		bencode(std::back_inserter(state_buf), state.reputation_state::to_entry());
-		ed25519_sign((unsigned char*)state.sig.data(),
-			(unsigned char const*)state_buf.data(),
-			state_buf.size(),
-			(unsigned char const*)i.key.pk.data(),
-			(unsigned char const*)i.key.sk.data());
+		state.sig = dht::ed25519_sign(state_buf
+			, i.key.pk
+			, i.key.sk);
 		tc.repman().store_state(i.rkey, client_reputation_key, state);
 		memset(&state, 0, sizeof(signed_state));
-		state.subject = hasher(tc.identity->key.pk.data(), tc.identity->key.pk.size()).final();
+		state.subject = hasher(tc.identity->key.pk.bytes).final();
 		tc.repman().state_at(i.rkey, client_reputation_key, state);
 		TEST_EQUAL(state.upload_direct, 10);
 		TEST_EQUAL(state.download_direct, 20);
@@ -822,10 +1019,7 @@ namespace
 		TEST_EQUAL(state.download_recommended, 40);
 		TEST_EQUAL(state.upload_referred, 50);
 		TEST_EQUAL(state.download_referred, 60);
-		int valid = ed25519_verify((unsigned char*)state.sig.data()
-			, (unsigned char*)state_buf.data()
-			, state_buf.size()
-			, (unsigned char*)i.key.pk.data());
+		int valid = dht::ed25519_verify(state.sig, state_buf, i.key.pk);
 		TEST_EQUAL(valid, 1);
 
 		return 0;
@@ -844,10 +1038,10 @@ namespace
 		new_state.download_direct = 5;
 		tc.repman().update_state_for(peer_ids[1].rkey, new_state);
 
-		boost::array<peer_connection_handle, 2> peers
+		std::array<peer_connection_handle, 2> peers
 			= {&peer_ids[0].connection, &peer_ids[1].connection};
 		std::vector<peer_connection_handle> ppeers;
-		for (boost::array<peer_connection_handle, 2>::iterator i = peers.begin();
+		for (std::array<peer_connection_handle, 2>::iterator i = peers.begin();
 			i != peers.end(); ++i)
 		{
 			i->m_impl->choked = true;
@@ -855,16 +1049,12 @@ namespace
 			ppeers.push_back(*i);
 		}
 
-		// add two dummy entries so that the test peers are in the upper half of the vector
-		ppeers.push_back((bt_peer_connection_mock_impl*)NULL);
-		ppeers.push_back((bt_peer_connection_mock_impl*)NULL);
+		std::array<std::uint64_t, 2> prios;
+		std::transform(peers.begin(), peers.end(), prios.begin()
+			, [&](peer_connection_handle const& e)
+				{ return tc.repman().get_unchoke_priority(e); });
 
-		tc.repman().on_optimistic_unchoke(ppeers);
-		TEST_EQUAL(ppeers.size(), 4);
-		TEST_EQUAL(ppeers[0].m_impl, peers[1].m_impl);
-		TEST_EQUAL(ppeers[1].m_impl, peers[0].m_impl);
-		TEST_EQUAL(ppeers[2].m_impl, (bt_peer_connection_mock_impl*)NULL);
-		TEST_EQUAL(ppeers[3].m_impl, (bt_peer_connection_mock_impl*)NULL);
+		TEST_CHECK(prios[0] > prios[1]);
 
 		return 0;
 	}
@@ -875,10 +1065,14 @@ namespace
 
 		{
 			aux::stack_allocator alloc;
-			external_ip_alert a(alloc, address::from_string("1.2.3.4"));
-			tc.repman().on_alert(&a);
-			a.external_address = address::from_string("::102:304");
-			tc.repman().on_alert(&a);
+			{
+				external_ip_alert a(alloc, address::from_string("1.2.3.4"));
+				tc.repman().on_alert(&a);
+			}
+			{
+				external_ip_alert a(alloc, address::from_string("::102:304"));
+				tc.repman().on_alert(&a);
+			}
 		}
 
 		TEST_EQUAL(tc.dht_store.size(), 1);
@@ -918,7 +1112,7 @@ namespace
 		old_state.subject = peer_ids[1].rid;
 		tc.repman().state_at(client_reputation_key, peer_ids[1].rkey, old_state);
 
-		reputation_id intermediary = hasher(tc.identity->key.pk.data(), tc.identity->key.pk.size()).final();
+		reputation_id intermediary = hasher(tc.identity->key.pk.bytes).final();
 		entry request;
 		{
 			request["q"] = std::string("update_standing");
@@ -931,13 +1125,11 @@ namespace
 			request["a"]["receipt"]["volume"] = 3;
 			std::vector<char> standing_buf;
 			bencode(std::back_inserter(standing_buf), request["a"]["receipt"]);
-			char sig_buf[64];
-			ed25519_sign((unsigned char*)sig_buf,
-				(unsigned char const*)standing_buf.data(),
-				standing_buf.size(),
-				(unsigned char const*)peer_ids[2].key.pk.data(),
-				(unsigned char const*)peer_ids[2].key.sk.data());
-			request["a"]["receipt"]["sig"] = std::string(sig_buf, 64);
+			dht::signature sig;
+			sig = dht::ed25519_sign(standing_buf
+				, peer_ids[2].key.pk
+				, peer_ids[2].key.sk);
+			request["a"]["receipt"]["sig"] = sig.bytes;
 			request["a"]["receipt"].dict().erase("intermediary");
 		}
 
@@ -948,11 +1140,9 @@ namespace
 			request["a"]["state"] = peer_state.reputation_state::to_entry();
 			std::vector<char> state_buf;
 			bencode(std::back_inserter(state_buf), request["a"]["state"]);
-			ed25519_sign((unsigned char*)peer_state.sig.data(),
-				(unsigned char const*)state_buf.data(),
-				state_buf.size(),
-				(unsigned char const*)peer_ids[1].key.pk.data(),
-				(unsigned char const*)peer_ids[1].key.sk.data());
+			peer_state.sig = dht::ed25519_sign(state_buf
+				, peer_ids[1].key.pk
+				, peer_ids[1].key.sk);
 			request["a"]["state"] = peer_state.to_entry();
 		}
 
@@ -985,14 +1175,12 @@ namespace
 		request["a"]["receipt"]["seq"] = 2;
 		request["a"]["receipt"]["volume"] = 5;
 		request_buf.clear();
-		char sig_buf[64];
+		dht::signature sig;
 		bencode(std::back_inserter(request_buf), request["a"]["receipt"]);
-		ed25519_sign((unsigned char*)sig_buf,
-			(unsigned char const*)request_buf.data(),
-			request_buf.size(),
-			(unsigned char const*)peer_ids[2].key.pk.data(),
-			(unsigned char const*)peer_ids[2].key.sk.data());
-		request["a"]["receipt"]["sig"] = std::string(sig_buf, 64);
+		sig = dht::ed25519_sign(request_buf
+			, peer_ids[2].key.pk
+			, peer_ids[2].key.sk);
+		request["a"]["receipt"]["sig"] = sig.bytes;
 		request["a"]["receipt"].dict().erase("intermediary");
 
 		request_buf.clear();
@@ -1019,8 +1207,6 @@ namespace
 
 	int test_update_standing_tx()
 	{
-		unsigned char seed[ed25519_seed_size];
-
 		test_client tc;
 		peer_ids_t peer_ids;
 		create_test_peers(tc.repman(), peer_ids);
@@ -1031,12 +1217,12 @@ namespace
 			ci.addr_v6 = asio::ip::address_v6::from_string("::1:2:3:4");
 			ci.port = 1;
 			lt_identify_keypair kp;
-			ed25519_create_seed(seed);
-			ed25519_create_keypair((unsigned char*)kp.pk.data(), (unsigned char*)kp.sk.data(), seed);
-			reputation_id rid = hasher(kp.pk.data(), kp.pk.size()).final();
+			auto seed = dht::ed25519_create_seed();
+			std::tie(kp.pk, kp.sk) = dht::ed25519_create_keypair(seed);
+			reputation_id rid = hasher(kp.pk.bytes).final();
 			reputation_key test_peer = tc.repman().establish_peer(kp.pk, rid, ci);
 			std::pair<stored_standing_update, signed_state> u = generate_forward_standing(tc.repman(), peer_ids[1], test_peer, rid);
-			tc.repman().forward_standing(u.first, u.second, boost::weak_ptr<reputation_session>());
+			tc.repman().forward_standing(u.first, u.second, std::weak_ptr<reputation_session>());
 			TEST_EQUAL(tc.ses->m_dht_direct_requests.size(), 1);
 			if (!tc.ses->m_dht_direct_requests.empty())
 			{
@@ -1060,12 +1246,12 @@ namespace
 			ci.addr_v4 = asio::ip::address_v4::from_string("1.2.3.4");
 			ci.port = 1;
 			lt_identify_keypair kp;
-			ed25519_create_seed(seed);
-			ed25519_create_keypair((unsigned char*)kp.pk.data(), (unsigned char*)kp.sk.data(), seed);
-			reputation_id rid = hasher(kp.pk.data(), kp.pk.size()).final();
+			auto seed = dht::ed25519_create_seed();
+			std::tie(kp.pk, kp.sk) = dht::ed25519_create_keypair(seed);
+			reputation_id rid = hasher(kp.pk.bytes).final();
 			reputation_key test_peer = tc.repman().establish_peer(kp.pk, rid, ci);
 			std::pair<stored_standing_update, signed_state> u = generate_forward_standing(tc.repman(), peer_ids[1], test_peer, rid);
-			tc.repman().forward_standing(u.first, u.second, boost::weak_ptr<reputation_session>());
+			tc.repman().forward_standing(u.first, u.second, std::weak_ptr<reputation_session>());
 			TEST_EQUAL(tc.ses->m_dht_direct_requests.size(), 1);
 			if (!tc.ses->m_dht_direct_requests.empty())
 			{
@@ -1090,12 +1276,12 @@ namespace
 			ci.addr_v6 = asio::ip::address_v6::from_string("::1:2:3:4");
 			ci.port = 1;
 			lt_identify_keypair kp;
-			ed25519_create_seed(seed);
-			ed25519_create_keypair((unsigned char*)kp.pk.data(), (unsigned char*)kp.sk.data(), seed);
-			reputation_id rid = hasher(kp.pk.data(), kp.pk.size()).final();
+			auto seed = dht::ed25519_create_seed();
+			std::tie(kp.pk, kp.sk) = dht::ed25519_create_keypair(seed);
+			reputation_id rid = hasher(kp.pk.bytes).final();
 			reputation_key test_peer = tc.repman().establish_peer(kp.pk, rid, ci);
 			std::pair<stored_standing_update, signed_state> u = generate_forward_standing(tc.repman(), peer_ids[1], test_peer, rid);
-			tc.repman().forward_standing(u.first, u.second, boost::weak_ptr<reputation_session>());
+			tc.repman().forward_standing(u.first, u.second, std::weak_ptr<reputation_session>());
 			for (int i = 0; i < 2; i++)
 			{
 				TEST_EQUAL(tc.ses->m_dht_direct_requests.size(), 1);
@@ -1138,12 +1324,12 @@ namespace
 			ci.addr_v6 = asio::ip::address_v6::from_string("::1:2:3:4");
 			ci.port = 1;
 			lt_identify_keypair kp;
-			ed25519_create_seed(seed);
-			ed25519_create_keypair((unsigned char*)kp.pk.data(), (unsigned char*)kp.sk.data(), seed);
-			reputation_id rid = hasher(kp.pk.data(), kp.pk.size()).final();
+			auto seed = dht::ed25519_create_seed();
+			std::tie(kp.pk, kp.sk) = dht::ed25519_create_keypair(seed);
+			reputation_id rid = hasher(kp.pk.bytes).final();
 			reputation_key test_peer = tc.repman().establish_peer(kp.pk, rid, ci);
 			std::pair<stored_standing_update, signed_state> u = generate_forward_standing(tc.repman(), peer_ids[1], test_peer, rid);
-			tc.repman().forward_standing(u.first, u.second, boost::weak_ptr<reputation_session>());
+			tc.repman().forward_standing(u.first, u.second, std::weak_ptr<reputation_session>());
 			for (int i = 0; i < 2; i++)
 			{
 				TEST_EQUAL(tc.ses->m_dht_direct_requests.size(), 1);
@@ -1165,7 +1351,11 @@ namespace
 
 			char ep_compact[22] = {4, 5, 6, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 5, 6, 7, 0, 2};
 			tc.ses->m_dht_store.push_back(
-				dht::item(entry(std::string(ep_compact, 22)), std::make_pair((char*)NULL, 0), 1, kp.pk.data(), kp.sk.data()));
+				dht::item(entry(std::string(ep_compact, 22))
+					, {}
+					, dht::sequence_number(1)
+					, kp.pk
+					, kp.sk));
 			test_time += 60*60*25;
 
 			for (int i = 0; i < 2; i++)
@@ -1215,8 +1405,6 @@ namespace
 
 	int test_update_standing_tx_multiple()
 	{
-		unsigned char seed[ed25519_seed_size];
-
 		test_client tc;
 		peer_ids_t peer_ids;
 		create_test_peers(tc.repman(), peer_ids);
@@ -1227,15 +1415,17 @@ namespace
 			ci.addr_v6 = asio::ip::address_v6::from_string("::1:2:3:4");
 			ci.port = 1;
 			lt_identify_keypair kp;
-			ed25519_create_seed(seed);
-			ed25519_create_keypair((unsigned char*)kp.pk.data(), (unsigned char*)kp.sk.data(), seed);
-			reputation_id rid = hasher(kp.pk.data(), kp.pk.size()).final();
+			auto seed = dht::ed25519_create_seed();
+			std::tie(kp.pk, kp.sk) = dht::ed25519_create_keypair(seed);
+			reputation_id rid = hasher(kp.pk.bytes).final();
 			reputation_key test_peer = tc.repman().establish_peer(kp.pk, rid, ci);
 			std::vector<std::pair<stored_standing_update, signed_state> > updates;
 			for (int i = 0; i < 3; ++i)
 			{
 				updates.push_back(generate_forward_standing(tc.repman(), peer_ids[i], test_peer, rid));
-				tc.repman().forward_standing(updates.back().first, updates.back().second, boost::weak_ptr<reputation_session>());
+				tc.repman().forward_standing(updates.back().first
+					, updates.back().second
+					, std::weak_ptr<reputation_session>());
 			}
 			TEST_EQUAL(tc.ses->m_dht_direct_requests.size(), 3);
 			for (std::vector<dht_direct_request_t>::iterator i = tc.ses->m_dht_direct_requests.begin()
@@ -1264,15 +1454,17 @@ namespace
 			ci.addr_v6 = asio::ip::address_v6::from_string("::1:2:3:4");
 			ci.port = 1;
 			lt_identify_keypair kp;
-			ed25519_create_seed(seed);
-			ed25519_create_keypair((unsigned char*)kp.pk.data(), (unsigned char*)kp.sk.data(), seed);
-			reputation_id rid = hasher(kp.pk.data(), kp.pk.size()).final();
+			auto seed = dht::ed25519_create_seed();
+			std::tie(kp.pk, kp.sk) = dht::ed25519_create_keypair(seed);
+			reputation_id rid = hasher(kp.pk.bytes).final();
 			reputation_key test_peer = tc.repman().establish_peer(kp.pk, rid, ci);
 			std::vector<std::pair<stored_standing_update, signed_state> > updates;
 			for (int req = 0; req < 2; ++req)
 			{
 				updates.push_back(generate_forward_standing(tc.repman(), peer_ids[req], test_peer, rid));
-				tc.repman().forward_standing(updates.back().first, updates.back().second, boost::weak_ptr<reputation_session>());
+				tc.repman().forward_standing(updates.back().first
+					, updates.back().second
+					, std::weak_ptr<reputation_session>());
 			}
 
 			// fail each request once to cause the IPV6 address to be failed
@@ -1310,7 +1502,9 @@ namespace
 				return 0;
 
 			updates.push_back(generate_forward_standing(tc.repman(), peer_ids[2], test_peer, rid));
-			tc.repman().forward_standing(updates.back().first, updates.back().second, boost::weak_ptr<reputation_session>());
+			tc.repman().forward_standing(updates.back().first
+				, updates.back().second
+				, std::weak_ptr<reputation_session>());
 
 			TEST_EQUAL(tc.ses->m_dht_direct_requests.size(), 3);
 
@@ -1340,16 +1534,18 @@ namespace
 			ci.addr_v6 = asio::ip::address_v6::from_string("::1:2:3:4");
 			ci.port = 1;
 			lt_identify_keypair kp;
-			ed25519_create_seed(seed);
-			ed25519_create_keypair((unsigned char*)kp.pk.data(), (unsigned char*)kp.sk.data(), seed);
-			reputation_id rid = hasher(kp.pk.data(), kp.pk.size()).final();
+			auto seed = dht::ed25519_create_seed();
+			std::tie(kp.pk, kp.sk) = dht::ed25519_create_keypair(seed);
+			reputation_id rid = hasher(kp.pk.bytes).final();
 			reputation_key test_peer = tc.repman().establish_peer(kp.pk, rid, ci);
 			std::vector<std::pair<stored_standing_update, signed_state> > updates;
 
 			for (int req = 0; req < 2; ++req)
 			{
 				updates.push_back(generate_forward_standing(tc.repman(), peer_ids[req], test_peer, rid));
-				tc.repman().forward_standing(updates.back().first, updates.back().second, boost::weak_ptr<reputation_session>());
+				tc.repman().forward_standing(updates.back().first
+					, updates.back().second
+					, std::weak_ptr<reputation_session>());
 			}
 
 			// fail each request once to cause the IPV6 address to be failed
@@ -1376,7 +1572,11 @@ namespace
 
 			char ep_compact[22] = {4, 5, 6, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 5, 6, 7, 0, 2};
 			tc.ses->m_dht_store.push_back(
-				dht::item(entry(std::string(ep_compact, 22)), std::make_pair((char*)NULL, 0), 1, kp.pk.data(), kp.sk.data()));
+				dht::item(entry(std::string(ep_compact, 22))
+					, {}
+					, dht::sequence_number(1)
+					, kp.pk
+					, kp.sk));
 			test_time += 60*60*25;
 
 			// the failing operation above reverses the order of the requests
@@ -1402,7 +1602,9 @@ namespace
 			TEST_EQUAL(tc.ses->m_dht_direct_requests.size(), 0);
 
 			updates.push_back(generate_forward_standing(tc.repman(), peer_ids[2], test_peer, rid));
-			tc.repman().forward_standing(updates.back().first, updates.back().second, boost::weak_ptr<reputation_session>());
+			tc.repman().forward_standing(updates.back().first
+				, updates.back().second
+				, std::weak_ptr<reputation_session>());
 
 			TEST_EQUAL(tc.ses->m_dht_direct_requests.size(), 0);
 			TEST_CHECK(tc.ses->m_pending_dht_alerts.pending());
@@ -1453,8 +1655,8 @@ namespace
 		bdecode(&*pos, &(*--buffer.end()) + 1, e, ec);
 		for (int i = 0; i < e.dict_size(); ++i)
 		{
-			TEST_EQUAL(e.dict_at(i).first.size(), reputation_id::size);
-			if (e.dict_at(i).first.size() != reputation_id::size)
+			TEST_EQUAL(e.dict_at(i).first.size(), reputation_id::size());
+			if (e.dict_at(i).first.size() != reputation_id::size())
 				continue;
 			reputation_id irid(e.dict_at(i).first.data());
 			TEST_EQUAL(irid, peer_id.rid);
@@ -1469,12 +1671,9 @@ namespace
 		test_peer_plugin(reputation_manager& repman)
 			: con(key.pk)
 		{
-			boost::array<unsigned char, ed25519_seed_size> seed;
-			ed25519_create_seed(seed.data());
-			ed25519_create_keypair((unsigned char*)key.pk.data()
-				, (unsigned char*)key.sk.data()
-				, seed.data());
-			peer = boost::make_shared<reputation_peer_plugin>(boost::ref(repman)
+			auto seed = dht::ed25519_create_seed();
+			std::tie(key.pk, key.sk) = dht::ed25519_create_keypair(seed);
+			peer = std::make_shared<reputation_peer_plugin>(std::ref(repman)
 				, bt_peer_connection_handle(&con));
 //			con.m_remote.address(asio::ip::address_v4::from_string("1.0.0.1"));
 //			con.m_remote.port(123);
@@ -1482,13 +1681,11 @@ namespace
 		}
 
 		test_peer_plugin(reputation_manager& repman
-			, boost::array<unsigned char, ed25519_seed_size> const& seed)
+			, std::array<char, 32> const& seed)
 			: con(key.pk)
 		{
-			ed25519_create_keypair((unsigned char*)key.pk.data()
-				, (unsigned char*)key.sk.data()
-				, seed.data());
-			peer = boost::make_shared<reputation_peer_plugin>(boost::ref(repman)
+			std::tie(key.pk, key.sk) = dht::ed25519_create_keypair(seed);
+			peer = std::make_shared<reputation_peer_plugin>(std::ref(repman)
 				, bt_peer_connection_handle(&con));
 			send_handshake();
 		}
@@ -1513,7 +1710,7 @@ namespace
 
 		lt_identify_keypair key;
 		bt_peer_connection_mock_impl con;
-		boost::shared_ptr<reputation_peer_plugin> peer;
+		std::shared_ptr<reputation_peer_plugin> peer;
 	};
 
 	int test_known_peers_tx()
@@ -1530,12 +1727,12 @@ namespace
 		if (!tp.con.sent_buffers.empty())
 		{
 			std::vector<char> const& buffer = tp.con.sent_buffers.front().first;
-			TEST_EQUAL(buffer.size(), 3 * reputation_id::size + 6);
-			if (buffer.size() == 3 * reputation_id::size + 6)
+			TEST_EQUAL(buffer.size(), 3 * reputation_id::size() + 6);
+			if (buffer.size() == 3 * reputation_id::size() + 6)
 			{
 				std::vector<char>::const_iterator pos
 					= buffer.begin();
-				TEST_EQUAL(detail::read_uint32(pos), 3 * reputation_id::size + 2);
+				TEST_EQUAL(detail::read_uint32(pos), 3 * reputation_id::size() + 2);
 				TEST_EQUAL(detail::read_uint8(pos), 20);
 				TEST_EQUAL(detail::read_uint8(pos), 1);
 				for (peer_ids_t::reverse_iterator i = peer_ids.rbegin();
@@ -1575,9 +1772,7 @@ namespace
 			for (peer_ids_t::const_iterator i = peer_ids.begin();
 				i != peer_ids.end(); ++i)
 				bi = std::copy(i->rid.begin(), i->rid.end(), bi);
-			tp.peer->on_extended(3 * reputation_id::size
-				, 10
-				, buffer::const_interval(body.data(), body.data() + body.size()));
+			tp.peer->on_extended(3 * reputation_id::size(), 10, body);
 		}
 
 		// induce the peer to send standing at all three test peers
@@ -1639,11 +1834,7 @@ namespace
 				entry state = peer_state.reputation_state::to_entry();
 				std::vector<char> state_buf;
 				bencode(std::back_inserter(state_buf), state);
-				ed25519_sign((unsigned char*)peer_state.sig.data(),
-					(unsigned char const*)state_buf.data(),
-					state_buf.size(),
-					(unsigned char const*)i->key.pk.data(),
-					(unsigned char const*)i->key.sk.data());
+				peer_state.sig = dht::ed25519_sign(state_buf, i->key.pk, i->key.sk);
 			}
 			{
 				entry standing;
@@ -1651,9 +1842,7 @@ namespace
 				standing[i->rid.to_string()].dict().erase("subject");
 				std::vector<char> body;
 				bencode(std::back_inserter(body), standing);
-				tp.peer->on_extended(body.size()
-					, 11
-					, buffer::const_interval(body.data(), body.data() + body.size()));
+				tp.peer->on_extended(body.size(), 11, body);
 			}
 		}
 
@@ -1690,8 +1879,9 @@ namespace
 				int total_contributions = 0;
 				for (int i = 0; i < e.dict_size(); i++)
 				{
-					TEST_CHECK(std::find_if(peer_ids.begin(), peer_ids.end()
-						, boost::bind(&test_identity::rid, _1) == reputation_id(e.dict_at(i).first.data())) != peer_ids.end());
+					TEST_CHECK(std::any_of(peer_ids.begin(), peer_ids.end()
+						, [&](test_identity const& tid)
+							{ return tid.rid == reputation_id(e.dict_at(i).first.data()); }));
 					total_contributions += e.dict_at(i).second.int_value();
 				}
 				TEST_EQUAL(total_contributions, 100);
@@ -1747,7 +1937,7 @@ namespace
 				TEST_EQUAL(bdecode(&*pos, &(*--buffer.end()) + 1, e, ec), 0);
 
 				TEST_EQUAL(e.dict_size(), 1);
-				TEST_EQUAL(e.dict_at(0).first.size(), reputation_id::size);
+				TEST_EQUAL(e.dict_at(0).first.size(), reputation_id::size());
 				reputation_id irid(e.dict_at(0).first.data());
 				TEST_EQUAL(irid, pid->rid);
 				signed_state istate(e.dict_at(0).second, tp.peer->rid(), pid->key.pk);
@@ -1770,14 +1960,10 @@ namespace
 			receipt["state"]["rr"] = 0;
 			std::vector<char> receipt_buf;
 			bencode(std::back_inserter(receipt_buf), receipt["state"]);
-			signature_type sig;
-			ed25519_sign((unsigned char*)sig.data()
-				, (unsigned char*)receipt_buf.data()
-				, receipt_buf.size()
-				, (unsigned char*)tp.key.pk.data()
-				, (unsigned char*)tp.key.sk.data());
+			dht::signature sig;
+			sig = dht::ed25519_sign(receipt_buf, tp.key.pk, tp.key.sk);
 			receipt["state"].dict().erase("subject");
-			receipt["state"]["sig"] = std::string(sig.begin(), sig.end());
+			receipt["state"]["sig"] = sig.bytes;
 
 			{
 				peer_ids_t::iterator i = peer_ids.end(); --i;
@@ -1789,23 +1975,19 @@ namespace
 				attribution["volume"] = 1024*1024*11;
 				std::vector<char> attrib_buf;
 				bencode(std::back_inserter(attrib_buf), attribution);
-				signature_type sig;
-				ed25519_sign((unsigned char*)sig.data()
-					, (unsigned char*)attrib_buf.data()
-					, attrib_buf.size()
-					, (unsigned char*)tp.key.pk.data()
-					, (unsigned char*)tp.key.sk.data());
+				dht::signature sig;
+				sig = ed25519_sign(attrib_buf
+					, tp.key.pk
+					, tp.key.sk);
 				attribution.erase("sender");
 				attribution.erase("recipient");
-				attribution["sig"] = std::string(sig.begin(), sig.end());
+				attribution["sig"] = sig.bytes;
 				receipt["receipts"].list().push_back(attribution);
 			}
 
 			std::vector<char> body;
 			bencode(std::back_inserter(body), receipt);
-			tp.peer->on_extended(body.size()
-				, 14
-				, buffer::const_interval(body.data(), body.data() + body.size()));
+			tp.peer->on_extended(body.size(), 14, body);
 		}
 
 		TEST_EQUAL(tc.ses->m_dht_direct_requests.size(), 1);
@@ -1825,11 +2007,8 @@ namespace
 
 			std::vector<char> verify_buf;
 			bencode(std::back_inserter(verify_buf), args["receipt"]);
-			TEST_EQUAL(ed25519_verify(
-				(unsigned char*)sig.data()
-				, (unsigned char*)verify_buf.data()
-				, verify_buf.size()
-				, (unsigned char*)tp.key.pk.data()), 1);
+			TEST_CHECK(dht::ed25519_verify(dht::signature(sig.data())
+				, verify_buf, tp.key.pk));
 		}
 
 		return 0;
@@ -1850,16 +2029,13 @@ namespace
 			attribution[peer_ids[2].rid.to_string()] = 33;
 			std::vector<char> body;
 			bencode(std::back_inserter(body), attribution);
-			tp.peer->on_extended(body.size()
-				, 13
-				, buffer::const_interval(body.data(), body.data() + body.size()));
+			tp.peer->on_extended(body.size(), 13, body);
 		}
 
 		{
 			peer_request req;
 			req.length = 1024 * 1024 * 11;
-			disk_buffer_holder buf_holder;
-			tp.peer->on_piece(req, buf_holder);
+			tp.peer->on_piece(req, span<char>());
 		}
 
 		TEST_EQUAL(tp.con.sent_buffers.size(), 1);
@@ -1882,7 +2058,7 @@ namespace
 			TEST_EQUAL(state.dict_find_int_value("ir", -1), 0);
 			TEST_EQUAL(state.dict_find_int_value("rs", -1), 0);
 			TEST_EQUAL(state.dict_find_int_value("rr", -1), 0);
-			TEST_EQUAL(state.dict_find_string("subject"), bdecode_node());
+			TEST_EQUAL(state.dict_find_string("subject").type(), bdecode_node::none_t);
 
 			{
 				entry state_verify;
@@ -1892,11 +2068,9 @@ namespace
 
 				std::vector<char> verify_buf;
 				bencode(std::back_inserter(verify_buf), state_verify);
-				TEST_EQUAL(ed25519_verify(
-					(unsigned char*)state.dict_find_string_value("sig").data()
-					, (unsigned char*)verify_buf.data()
-					, verify_buf.size()
-					, (unsigned char*)tc.identity->key.pk.data()), 1);
+				TEST_CHECK(dht::ed25519_verify(dht::signature(state.dict_find_string_value("sig").data())
+					, verify_buf
+					, tc.identity->key.pk));
 			}
 
 			boost::int64_t total_attributed = 0;
@@ -1905,8 +2079,8 @@ namespace
 			{
 				bdecode_node receipt = receipts.list_at(i);
 				peer_ids_t::iterator intermediary = std::find_if(peer_ids.begin(), peer_ids.end()
-					, boost::bind(&test_identity::rid, _1)
-						== reputation_id(receipt.dict_find_string_value("intermediary").data()));
+					, [&](test_identity const& tid) { return tid.rid
+						== reputation_id(receipt.dict_find_string_value("intermediary").data()); });
 				TEST_CHECK(intermediary != peer_ids.end());
 				int contribution = intermediary == peer_ids.begin() ? 34 : 33;
 				boost::int64_t expected_volume = i < receipts.list_size() - 1
@@ -1924,11 +2098,9 @@ namespace
 
 				std::vector<char> verify_buf;
 				bencode(std::back_inserter(verify_buf), receipt_verify);
-				TEST_EQUAL(ed25519_verify(
-					(unsigned char*)receipt.dict_find_string_value("sig").data()
-					, (unsigned char*)verify_buf.data()
-					, verify_buf.size()
-					, (unsigned char*)tc.identity->key.pk.data()), 1);
+				TEST_CHECK(dht::ed25519_verify(dht::signature(receipt.dict_find_string_value("sig").data())
+					, verify_buf
+					, tc.identity->key.pk));
 			}
 		}
 
@@ -1939,8 +2111,7 @@ namespace
 
 	int test_standing_persistence()
 	{
-		boost::array<unsigned char, ed25519_seed_size> seed;
-		ed25519_create_seed(seed.data());
+		auto seed = dht::ed25519_create_seed();
 
 		peer_ids_t peer_ids;
 
@@ -1951,8 +2122,7 @@ namespace
 			tp.peer->sent_payload(1024*1024*11);
 			peer_request req;
 			req.length = 1024*1024*11;
-			disk_buffer_holder buf_holder;
-			tp.peer->on_piece(req, buf_holder);
+			tp.peer->on_piece(req, span<char>());
 		}
 
 		test_client tc;
@@ -1961,8 +2131,7 @@ namespace
 		tp.peer->sent_payload(1024*1024*11);
 		peer_request req;
 		req.length = 1024*1024*11;
-		disk_buffer_holder buf_holder;
-		tp.peer->on_piece(req, buf_holder);
+		tp.peer->on_piece(req, span<char>());
 
 		signed_state state;
 		state.subject = peer_ids[0].rid;
@@ -1984,8 +2153,10 @@ namespace
 		char ep_compact[6] = {1, 0, 0, 1, 0, 12};
 		tc.ses->m_dht_store.push_back(
 			dht::item(entry(std::string(ep_compact, 6))
-				, std::make_pair((char*)NULL, 0)
-				, 1, peer_ids[0].key.pk.data(), peer_ids[0].key.sk.data()));
+				, span<char const>()
+				, dht::sequence_number(1)
+				, peer_ids[0].key.pk
+				, peer_ids[0].key.sk));
 
 		tp.peer->establish_rkey();
 		tc.repman().get_standing(peer_ids[0].rkey, tp.peer->rkey(), tc.repman().peer_session(tp.peer->rid()));
@@ -2029,28 +2200,28 @@ using namespace libtorrent;
 TORRENT_TEST(reputation_manager)
 {
 	int (*tests[])(void) =
-		{test_known_peers
-		, test_update_state
-		, test_download_multiplier
-		, test_single_attribution
-		, test_state_at
-		, test_optimistic_unchoke
-		, test_put_ci
-		, test_update_standing_rx
-		, test_update_standing_tx
-		, test_update_standing_tx_multiple
-		, test_known_peers_tx
-		, test_standing_tx
-		, test_indirect_credit_rx
-		, test_attribution_rx
-		, test_standing_persistence
-		, test_get_standing_failure
+		{ mocks::test_known_peers
+		, mocks::test_update_state
+		, mocks::test_download_multiplier
+		, mocks::test_single_attribution
+		, mocks::test_state_at
+		, mocks::test_optimistic_unchoke
+		, mocks::test_put_ci
+		, mocks::test_update_standing_rx
+		, mocks::test_update_standing_tx
+		, mocks::test_update_standing_tx_multiple
+		, mocks::test_known_peers_tx
+		, mocks::test_standing_tx
+		, mocks::test_indirect_credit_rx
+		, mocks::test_attribution_rx
+		, mocks::test_standing_persistence
+		, mocks::test_get_standing_failure
 		, NULL};
 
 	for (int i = 0; tests[i] != NULL; ++i)
 	{
-		current_time = ::libtorrent::clock_type::now();
-		test_time = ::time(NULL);
+		mocks::current_time = ::libtorrent::clock_type::now();
+		mocks::test_time = ::time(NULL);
 		std::remove("reputation.sqlite");
 		if ((*tests[i])())
 			return;

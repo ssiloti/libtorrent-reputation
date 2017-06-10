@@ -23,10 +23,8 @@
 		(p)[3] = (uint8_t)((v) >> 24); \
 	} while (0)
 
-using namespace boost::asio;
-
 void poly1305_auth(unsigned char out[POLY1305_TAGLEN]
-	, std::vector<mutable_buffer> const& m_vec
+	, libtorrent::span<libtorrent::span<char>> m_vec
 	, const unsigned char key[POLY1305_KEYLEN])
 {
 	uint32_t t0,t1,t2,t3;
@@ -34,20 +32,20 @@ void poly1305_auth(unsigned char out[POLY1305_TAGLEN]
 	uint32_t r0,r1,r2,r3,r4;
 	uint32_t s1,s2,s3,s4;
 	uint32_t b, nb;
-	size_t j;
+	std::size_t j;
 	uint64_t t[5];
 	uint64_t f0,f1,f2,f3;
 	uint32_t g0,g1,g2,g3,g4;
 	uint64_t c;
 	unsigned char mp[16];
-	size_t inlen = 0;
-	std::vector<mutable_buffer>::const_iterator buf = m_vec.begin();
+	std::size_t inlen = 0;
+	auto buf = m_vec.begin();
 	const unsigned char* m;
 
 	if (buf != m_vec.end())
 	{
-		m = buffer_cast<const unsigned char*>(*buf);
-		inlen = buffer_size(*buf);
+		m = reinterpret_cast<const unsigned char*>(buf->data());
+		inlen = buf->size();
 	}
 
 	/* clamp key */
@@ -114,8 +112,8 @@ poly1305_donna_atmost15bytes:
 	for (j = 0; j < inlen; j++) mp[j] = m[j];
 	while (j < 16 && ++buf != m_vec.end())
 	{
-		m = buffer_cast<const unsigned char*>(*buf);
-		inlen = buffer_size(*buf);
+		m = reinterpret_cast<const unsigned char*>(buf->data());
+		inlen = buf->size();
 		if (j == 0 && inlen >= 16) goto poly1305_donna_16bytes;
 		for (; j < 16 && inlen; j++, inlen--)
 			mp[j] = *m++;

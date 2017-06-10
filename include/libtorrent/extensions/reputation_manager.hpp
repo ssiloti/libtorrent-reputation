@@ -37,7 +37,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #pragma warning(push, 1)
 #endif
 
-#include <boost/shared_ptr.hpp>
+#include <memory>
 
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -62,13 +62,13 @@ namespace libtorrent
 	struct TORRENT_REPUTATION_EXPORT reputation_handle
 	{
 		reputation_handle() {}
-		reputation_handle(boost::shared_ptr<plugin> repman)
+		reputation_handle(std::shared_ptr<plugin> repman)
 			: reputation_plugin(repman) {}
 
 		// get the client's global ratio
 		double global_ratio();
 		// pass this to session::add_extension() to register the plugin
-		boost::shared_ptr<plugin> reputation_plugin;
+		std::shared_ptr<plugin> reputation_plugin;
 	};
 
 	// create a reputation plugin instance
